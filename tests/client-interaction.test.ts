@@ -3,7 +3,6 @@ import { runInNewContext } from 'node:vm'
 import React from 'react'
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Config, LIVE_SETTING_KEYS, liveHostConfig } from '../src/settings.js'
 
 type SettingsDocument = { writable: boolean; namespaces: Array<{ ns: string; revision: number; value: Record<string, unknown> }> }
 
@@ -22,15 +21,9 @@ afterEach(async () => {
   await act(async () => { for (const renderer of renderers.splice(0)) renderer.unmount() })
 })
 
-/** Real React hooks and rerenders; only the DSH loader/transport and browser timers are substituted. */
-type SharedQuotaReader = ((force: boolean, source?: string) => Promise<unknown>) & {
-  observeProxyAccount(snapshot: { phase: string; revision: number }): void
-  observeMode(source: string): void
-}
-function loadCard(quotaRead?: () => Promise<unknown>) {
+function loadCard() {
   let registration: { factory(require: (id: string) => unknown): { apply(ctx: unknown): void } } | undefined
   const components = new Map<string, React.ComponentType<Record<string, unknown>>>()
-  const injections = new Map<string, () => Record<string, unknown>>()
   const intervals = new Map<number, { callback: () => void; delay: number }>()
   let timerId = 0
   runInNewContext(buildClientSource(), {
@@ -44,20 +37,18 @@ function loadCard(quotaRead?: () => Promise<unknown>) {
     inject: (_name: string, callback: () => void) => { callback(); return () => {} },
     register: (row: { id: string; inject?: () => Record<string, unknown> }, component: React.ComponentType<Record<string, unknown>>) => {
       components.set(row.id, component)
-      if (row.inject) injections.set(row.id, row.inject)
       return () => {}
     },
   }
   const ctx = {
     slots,
     remote: { $mount: () => () => {} },
-    get: (name: string) => name === 'remote.agyQuota' ? { read: quotaRead, refresh: quotaRead } : undefined,
+    get: () => undefined,
     effect: (callback: () => unknown) => callback(),
     inject: (_names: string[], callback: (scope: unknown) => void) => callback(ctx),
   }
   registration!.factory(() => React).apply(ctx)
-  return { Card: components.get('antigravity-acp')!, Pill: components.get('antigravity-quota')!, intervals,
-    reader: injections.get('antigravity-acp')!().readQuota as SharedQuotaReader }
+  return { Card: components.get('antigravity-acp')!, intervals }
 }
 
 function transport(initial = document()) {
@@ -78,25 +69,12 @@ function transport(initial = document()) {
   }
 }
 
-async function mount(remote: unknown, control?: unknown, proxyControl?: unknown, readQuota?: unknown) {
+async function mount(remote: unknown, control?: unknown) {
   const { Card, intervals } = loadCard()
   let renderer!: ReactTestRenderer
-  await act(async () => { renderer = create(React.createElement(Card, { remote, control, proxyControl, readQuota })) })
+  await act(async () => { renderer = create(React.createElement(Card, { remote, control })) })
   renderers.push(renderer)
   return { renderer, intervals }
-}
-
-async function mountPill(readQuota: unknown) {
-  const { Pill } = loadCard()
-  const modelSnapshot = { current: { provider: 'antigravity-acp', model: 'gemini-flash' } }
-  const store = {
-    subscribe: () => () => {},
-    getSnapshot: () => modelSnapshot,
-  }
-  let renderer!: ReactTestRenderer
-  await act(async () => { renderer = create(React.createElement(Pill, { store, readQuota })) })
-  renderers.push(renderer)
-  return renderer
 }
 
 function button(renderer: ReactTestRenderer, label: string): ReactTestInstance {
@@ -111,309 +89,7 @@ function modelControl(renderer: ReactTestRenderer, kind: 'enabled' | 'effort' | 
 }
 function renderedText(renderer: ReactTestRenderer): string { return JSON.stringify(renderer.toJSON()) }
 
-describe('quota pill with real React state and effects', () => {
-  it('设置页关闭时，实际共享读取器仍随代理退出和换账户清空并更新药丸', async () => {
-    let snapshot = { phase: 'signed-in', revision: 1 }
-    const quotaRead = vi.fn(async () => snapshot.phase === 'signed-in'
-      ? { status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: snapshot.revision === 1 ? 81 : 34 }] }] }
-      : { status: 'error', groups: [], error: { message: '代理账户未登录' } })
-    const { Pill, intervals, reader } = loadCard(quotaRead)
-    const proxyControl = async () => ({ snapshot })
-    const store = { subscribe: () => () => {}, getSnapshot: () => state }
-    const state = { current: { provider: 'antigravity-proxy', model: 'antigravity-gemini-3.8-flash' } }
-    let renderer!: ReactTestRenderer
-    await act(async () => { renderer = create(React.createElement(Pill, { store, readQuota: reader, proxyControl })) })
-    renderers.push(renderer)
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(81)
-    snapshot = { phase: 'signed-out', revision: 2 }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    expect(renderer.root.findAllByProps({ role: 'progressbar' })).toHaveLength(0)
-    snapshot = { phase: 'signed-in', revision: 3 }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(34)
-    expect(quotaRead).toHaveBeenCalledTimes(3)
-  })
-  it('共享额度读取器通知自身时也结束刷新，可再次手动刷新', async () => {
-    const listeners = new Set<(value: unknown, source: unknown) => void>()
-    const snapshot = { status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }] }
-    const readQuota = Object.assign(vi.fn(async (_force: boolean, source: unknown) => {
-      for (const listener of listeners) listener(snapshot, source)
-      return snapshot
-    }), { subscribe: (listener: (value: unknown, source: unknown) => void) => { listeners.add(listener); return () => listeners.delete(listener) } })
-    const renderer = await mountPill(readQuota)
-    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
-    expect(button(renderer, '刷新额度').props.disabled).toBe(false)
-    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
-    expect(readQuota).toHaveBeenCalledTimes(2)
-    expect(button(renderer, '刷新额度').props.disabled).toBe(false)
-    await act(async () => { renderer.root.findByProps({ 'aria-label': '关闭额度详情' }).props.onClick() })
-    expect(renderer.root.findAllByProps({ role: 'dialog' })).toHaveLength(0)
-  })
-  it('ACP 与代理切换时清除旧额度并立即取新数据，代理模型可匹配额度组', async () => {
-    const { Pill } = loadCard()
-    const pending = deferred<unknown>()
-    let snapshot = { current: { provider: 'antigravity-acp', model: 'gemini-flash' } }
-    const listeners = new Set<() => void>()
-    const store = { subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener) } }, getSnapshot: () => snapshot }
-    const readQuota = vi.fn(async () => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }] }) as unknown)
-    readQuota.mockImplementationOnce(async () => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }] }))
-    readQuota.mockImplementationOnce(() => pending.promise)
-    let renderer!: ReactTestRenderer
-    await act(async () => { renderer = create(React.createElement(Pill, { store, readQuota })) })
-    renderers.push(renderer)
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(82)
-    await act(async () => {
-      snapshot = { current: { provider: 'antigravity-proxy', model: 'antigravity-gemini-3.8-flash' } }
-      for (const listener of listeners) listener()
-    })
-    expect(readQuota).toHaveBeenCalledTimes(2)
-    expect(renderer.root.findAllByProps({ role: 'progressbar' })).toHaveLength(0)
-    await act(async () => { pending.resolve({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 42 }] }] }) })
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(42)
-  })
-
-  it('跨家族官方映射使用实际路由模型的额度组', async () => {
-    const renderer = await mountPill(async () => ({
-      status: 'ok', requestedModel: 'gemini-flash', routeModel: 'claude-opus-5-5-low',
-      groups: [
-        { name: 'Gemini', buckets: [{ window: '5h', remainingPct: 81 }] },
-        { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 42 }] },
-      ],
-    }))
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(42)
-  })
-
-  it('失败信封转成可读错误，不把异常抛出组件', async () => {
-    const renderer = await mountPill(async () => ({ ok: false, error: { message: 'remote denied' } }))
-    expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).toContain('额度读取失败')
-    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
-    expect(renderedText(renderer)).toContain('remote denied')
-  })
-
-  it('刷新异常保留成功快照并标缓存，后续成功清除缓存标记', async () => {
-    let fail = false
-    const snapshot = { status: 'ok', updatedAt: '2026-10-25T00:00:00Z', groups: [
-      { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 82 }] },
-    ] }
-    const readQuota = vi.fn(async () => {
-      if (fail) throw new Error('refresh timeout')
-      return snapshot
-    })
-    const renderer = await mountPill(readQuota)
-    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
-    expect(renderedText(renderer)).toContain('82')
-    fail = true
-    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
-    expect(renderedText(renderer)).toContain('缓存数据 · Error: refresh timeout')
-    expect(renderedText(renderer)).toContain('82')
-    fail = false
-    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
-    expect(renderedText(renderer)).not.toContain('缓存数据')
-    expect(renderedText(renderer)).toContain('82')
-  })
-})
-
 describe('settings card with real React state and effects', () => {
-  it('实际共享读取器丢弃旧账户的迟到广播，不覆盖新账户已成功额度', async () => {
-    const pending = deferred<unknown>()
-    const quotaRead = vi.fn(async () => ({ status: 'ok', groups: [{ name: 'CURRENT-B', buckets: [{ remainingPct: 34 }] }] }) as unknown)
-    quotaRead.mockImplementationOnce(() => pending.promise)
-    const { reader } = loadCard(quotaRead)
-    const service = transport(document({ proxyMode: true }))
-    let snapshot = { phase: 'signed-in', revision: 1, message: 'A' }
-    const proxyControl = async () => ({ snapshot })
-    const { renderer, intervals } = await mount(service.remote, undefined, proxyControl, reader)
-    let first: Promise<void> | undefined
-    await act(async () => { first = button(renderer, '拉取额度').props.onClick() })
-    snapshot = { phase: 'signed-in', revision: 3, message: 'B' }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    await act(async () => { await button(renderer, '拉取额度').props.onClick() })
-    expect(renderedText(renderer)).toContain('CURRENT-B')
-    await act(async () => { pending.resolve({ status: 'error', groups: [], error: { message: 'STALE-A-ACCOUNT-CHANGED' } }); await first })
-    expect(renderedText(renderer)).toContain('CURRENT-B')
-    expect(renderedText(renderer)).not.toContain('STALE-A-ACCOUNT-CHANGED')
-  })
-  it('保存栏常驻顶部，只提供一个保存入口，编辑和撤销更新未保存计数', async () => {
-    const service = transport(document())
-    const { renderer } = await mount(service.remote)
-    const bar = renderer.root.findByProps({ 'aria-label': '设置保存操作' })
-    expect(bar.props.style).toMatchObject({ position: 'sticky', top: 0, display: 'none' })
-    expect(bar.findAllByType('button').filter(node => node.children.join('') === '保存')).toHaveLength(1)
-    expect(button(renderer, '保存').props.disabled).toBe(true)
-    await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: 'http://127.0.0.1:7890' } }) })
-    expect(renderedText(renderer)).toContain('1 项未保存')
-    expect(bar.props.style.display).toBe('grid')
-    expect(button(renderer, '保存').props.disabled).toBe(false)
-    await act(async () => { button(renderer, '撤销').props.onClick() })
-    expect(renderedText(renderer)).not.toContain('项未保存')
-    expect(button(renderer, '保存').props.disabled).toBe(true)
-  })
-
-  it('未保存网络设置阻止使用旧设置连接，但取消登录仍可用', async () => {
-    const service = transport(document({ proxyMode: true }))
-    const proxyControl = vi.fn(async () => ({ snapshot: { phase: 'pending-login', connectionStage: 'authorizing', revision: 0, message: '等待授权' } }))
-    const { renderer } = await mount(service.remote, undefined, proxyControl)
-    await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: 'http://127.0.0.1:7890' } }) })
-    expect(renderedText(renderer)).toContain('请先保存网络设置')
-    expect(button(renderer, '取消登录').props.disabled).toBe(false)
-    await act(async () => { await button(renderer, '取消登录').props.onClick() })
-    expect(proxyControl).toHaveBeenCalledWith('account', { action: 'cancel' })
-  })
-
-  it('授权等待与回调完成阶段清晰可见，阶段轮询不重复拉取目录', async () => {
-    const service = transport(document({ proxyMode: true }))
-    let snapshot = { phase: 'signed-out', connectionStage: '', message: '未登录', revision: 0 }
-    const proxyControl = vi.fn(async (_method: string, request: { action: string }) => {
-      if (request.action === 'login') snapshot = { phase: 'pending-login', connectionStage: 'authorizing', message: '请在浏览器授权', revision: 0 }
-      return { snapshot, message: snapshot.message, ...(request.action === 'login' ? { authorizationUrl: 'https://accounts.google.com/synthetic' } : {}) }
-    })
-    const { renderer, intervals } = await mount(service.remote, controlWith(), proxyControl)
-    expect(renderedText(renderer)).toContain('无需 agy CLI')
-    await act(async () => { await button(renderer, '连接代理账户').props.onClick() })
-    const link = renderer.root.findByType('a')
-    expect(link.children.join('')).toBe('打开 Google 授权页')
-    expect(link.props.rel).toContain('noopener')
-    const calls = proxyControl.mock.calls.length
-    snapshot = { phase: 'pending-login', connectionStage: 'finishing', message: '授权已收到，正在检测项目', revision: 0 }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    expect(proxyControl.mock.calls.length).toBeGreaterThan(calls)
-    expect(renderedText(renderer)).toContain('正在完成登录')
-    expect(renderedText(renderer)).toContain('授权已收到，正在检测项目')
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
-    expect(button(renderer, '取消登录').props.disabled).toBe(false)
-  })
-
-  it('设置页自动读快照，只在点击时请求刷新', async () => {
-    const service = transport(document({ proxyMode: true }))
-    const readQuota = vi.fn(async (_force: boolean, _source?: string, _model?: string) => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 73 }] }] }) as unknown)
-    const { renderer, intervals } = await mount(service.remote, undefined, undefined, readQuota)
-    expect(readQuota).toHaveBeenCalledWith(false, 'antigravity-proxy', undefined)
-    expect(renderedText(renderer)).toContain('73')
-    await act(async () => { for (const timer of intervals.values()) timer.callback() })
-    expect(readQuota.mock.calls.every(([force]) => force === false)).toBe(true)
-    await act(async () => { await button(renderer, '拉取额度').props.onClick() })
-    expect(readQuota).toHaveBeenCalledWith(true, 'antigravity-proxy', undefined)
-    expect(renderedText(renderer)).toContain('73')
-    readQuota.mockRejectedValueOnce(new Error('额度网络超时'))
-    await act(async () => { await button(renderer, '拉取额度').props.onClick() })
-    expect(renderedText(renderer)).toContain('73')
-    expect(renderedText(renderer)).toContain('缓存数据 · Error: 额度网络超时')
-    expect(button(renderer, '拉取额度').props.disabled).toBe(false)
-  })
-
-  it('设置页切换额度来源时清空旧结果，不接纳旧模式的迟到请求', async () => {
-    const service = transport(document({ proxyMode: true }))
-    const pending = deferred<unknown>()
-    const readQuota = vi.fn((force: boolean) => force ? pending.promise : Promise.resolve({ status: 'error', groups: [], error: { code: 'not-fetched' } }))
-    const { renderer } = await mount(service.remote, undefined, undefined, readQuota)
-    let request: Promise<void> | undefined
-    await act(async () => { request = button(renderer, '拉取额度').props.onClick() })
-    await act(async () => { service.change(document({ proxyMode: false }, 2)) })
-    await act(async () => { pending.resolve({ status: 'ok', groups: [{ name: 'former-account', buckets: [{ remainingPct: 99 }] }] }); await request })
-    expect(renderedText(renderer)).not.toContain('former-account')
-    expect(renderedText(renderer)).toContain('暂无额度快照')
-    expect(button(renderer, '拉取额度').props.disabled).toBe(false)
-  })
-  it('模式草稿不冒充已生效模式，代理模式保存后显示对应连接控件', async () => {
-    const service = transport(document())
-    const control = vi.fn(async (method: string) => method === 'account'
-      ? { state: 'idle', message: 'ready' }
-      : { status: 'ok', models: [] })
-    const { renderer } = await mount(service.remote, control)
-    await act(async () => { fieldInput(renderer, 'proxyMode').props.onChange({ target: { checked: true } }) })
-    expect(service.mutate).not.toHaveBeenCalled()
-    expect(renderedText(renderer)).toContain('保存后切换到代理模式')
-    expect(renderedText(renderer)).not.toContain('生成与套餐额度使用此账户')
-    expect(button(renderer, '连接 / 登录 ACP')).toBeDefined()
-    await act(async () => { service.change(document({ proxyMode: true }, 2)) })
-    expect(button(renderer, '连接 / 登录 ACP')).toBeUndefined()
-    expect(button(renderer, '立即预热')).toBeUndefined()
-    expect(renderedText(renderer)).toContain('生成与套餐额度使用此账户')
-  })
-
-  it('代理组件缺席时仍停用 ACP，不提供任何 ACP 连接操作', async () => {
-    const service = transport(document({ proxyMode: true }))
-    const control = vi.fn(async (method: string) => method === 'account'
-      ? { state: 'idle', message: 'ready', generationMode: { requested: 'proxy', active: 'acp', proxyRouterReady: false } }
-      : { status: 'ok', models: [] })
-    const { renderer } = await mount(service.remote, control)
-    expect(renderedText(renderer)).toContain('代理路由未就绪，ACP 保持停用')
-    expect(renderedText(renderer)).toContain('未注册')
-    expect(renderedText(renderer)).toContain('生成与套餐额度使用此账户')
-    expect(button(renderer, '连接 / 登录 ACP')).toBeUndefined()
-    expect(renderer.root.findAllByProps({ name: 'agyCliPath' })).toHaveLength(1)
-    expect(renderer.root.findAllByProps({ name: 'binaryPath' })).toHaveLength(0)
-  })
-
-  it('代理 OAuth 完成和退出后自动更新目录，终态移除旧授权提示与链接', async () => {
-    const service = transport(document({ proxyMode: true }))
-    let snapshot = { phase: 'signed-out', message: '请连接代理账户', revision: 0 }
-    const proxyControl = vi.fn(async (_method: string, request: { action: string }) => {
-      if (request.action === 'login') {
-        snapshot = { phase: 'pending-login', message: '等待浏览器授权', revision: 1 }
-        return { snapshot, message: snapshot.message, authorizationUrl: 'https://accounts.google.com/synthetic' }
-      }
-      if (request.action === 'logout') snapshot = { phase: 'signed-out', message: '已退出登录', revision: 3 }
-      return { snapshot, message: snapshot.message }
-    })
-    const control = vi.fn(async (method: string) => method === 'account'
-      ? { state: 'idle', message: 'ready' }
-      : snapshot.phase === 'signed-in'
-        ? { status: 'ok', models: [{ id: 'antigravity-gemini-3.8-flash', name: 'Gemini Flash' }] }
-        : { status: 'error', models: [], message: '代理账户尚未连接' })
-    const { renderer, intervals } = await mount(service.remote, control, proxyControl)
-    await act(async () => { await button(renderer, '连接代理账户').props.onClick() })
-    expect(renderer.root.findAllByType('a')).toHaveLength(1)
-    const pulls = control.mock.calls.filter(([method]) => method === 'models').length
-    snapshot = { phase: 'signed-in', message: '代理账户已就绪', revision: 2 }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    expect(control.mock.calls.filter(([method]) => method === 'models').length).toBeGreaterThan(pulls)
-    expect(renderedText(renderer)).toContain('Gemini Flash')
-    expect(renderedText(renderer)).not.toContain('等待浏览器授权')
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
-    await act(async () => { await button(renderer, '退出登录').props.onClick() })
-    expect(renderedText(renderer)).not.toContain('Gemini Flash')
-    expect(renderedText(renderer)).toContain('代理账户尚未连接')
-  })
-
-  it('代理授权失败显示轮询得到的具体原因，并清理旧授权链接', async () => {
-    const service = transport(document({ proxyMode: true }))
-    let snapshot = { phase: 'signed-out', message: '未连接', revision: 0 }
-    const proxyControl = vi.fn(async (_method: string, request: { action: string }) => {
-      if (request.action === 'login') snapshot = { phase: 'pending-login', message: '等待浏览器授权', revision: 1 }
-      return { snapshot, message: snapshot.message, ...(snapshot.phase === 'pending-login' ? { authorizationUrl: 'https://accounts.google.com/synthetic' } : {}) }
-    })
-    const { renderer, intervals } = await mount(service.remote, undefined, proxyControl)
-    await act(async () => { await button(renderer, '连接代理账户').props.onClick() })
-    snapshot = { phase: 'login-failed', message: '上游项目初始化失败，请重新连接', revision: 2 }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    expect(renderedText(renderer)).toContain('上游项目初始化失败，请重新连接')
-    expect(renderedText(renderer)).not.toContain('等待浏览器授权')
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
-  })
-
-  it('连接请求尚未返回时可以取消，迟到授权结果不恢复登录界面', async () => {
-    const service = transport(document({ proxyMode: true }))
-    const pending = deferred<unknown>()
-    const proxyControl = vi.fn(async (_method: string, request: { action: string }) => request.action === 'login'
-      ? pending.promise
-      : { snapshot: { phase: 'signed-out', message: '代理模式登录已取消', revision: 1 }, message: '代理模式登录已取消' })
-    const { renderer } = await mount(service.remote, undefined, proxyControl)
-    let login: Promise<void> | undefined
-    await act(async () => { login = button(renderer, '连接代理账户').props.onClick() })
-    expect(button(renderer, '取消登录').props.disabled).toBe(false)
-    await act(async () => { await button(renderer, '取消登录').props.onClick() })
-    expect(proxyControl).toHaveBeenCalledWith('account', { action: 'cancel' })
-    await act(async () => {
-      pending.resolve({ snapshot: { phase: 'pending-login', message: '等待授权', revision: 0 }, authorizationUrl: 'https://accounts.google.com/stale' })
-      await login
-    })
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
-    expect(button(renderer, '连接代理账户').props.disabled).toBe(false)
-    expect(renderedText(renderer)).not.toContain('等待授权')
-  })
-
-  /** 目录桩：两个模型，供逐模型设置渲染。 */
   const catalog = () => ({ status: 'ok' as const, models: [
     { id: 'gemini-3-pro', name: 'Gemini 3 Pro', inputModalities: ['text', 'image'] },
     { id: 'claude-sonnet-5-5', name: 'Claude Sonnet' },
@@ -421,57 +97,53 @@ describe('settings card with real React state and effects', () => {
   const controlWith = (models: unknown = catalog(), account: Record<string, unknown> = { state: 'idle', message: 'ready' }) =>
     vi.fn(async (method: string) => method === 'account' ? account : models)
 
-  it('设置卡片只提交即时字段，普通配置以重载指引呈现', async () => {
-    const liveKeys: readonly string[] = [...LIVE_SETTING_KEYS]
-    const fields = liveKeys.filter(key => key !== 'modelOverrides' && key !== 'proxyBypass')
-    // 普通（非 volatile）配置：宿主既不投影也不接受写入，不能出现在可编辑控件里。
-    const plainFields = Object.keys(Config.dict ?? {}).filter(key => !liveKeys.includes(key))
-    expect(plainFields).toEqual(expect.arrayContaining(['binaryPath', 'autoDownload', 'acpVersion', 'extraArgs', 'maxConcurrentSessions', 'queueTimeoutMs', 'requestTimeoutMs', 'handshakeTimeoutMs', 'authTimeoutMs', 'promptTimeoutMs', 'bridgeParkSettleMs']))
-    expect(fields).not.toContain('proxyBypass')
-    const values = liveHostConfig(Config({ autoWarmup: false }))
-    const projected: Record<string, unknown> = Object.fromEntries(fields.map(key => [key, Reflect.get(values, key)]))
-    const service = transport(document(projected))
-    service.mutate.mockImplementation(async (_ns, ops, revision) => {
-      expect(revision).toBe(1)
-      for (const value of ops) {
-        const op = value as { path: string[]; value: unknown }
-        expect([...fields, 'modelOverrides']).toContain(op.path[0])
-        projected[op.path[0]!] = op.value
-      }
-      service.change(document(projected, 2))
-      return { ok: true, value: undefined }
-    })
-    const { renderer } = await mount(service.remote, controlWith())
-    // modelOverrides 由逐模型行渲染，不是普通输入框。
-    const renderable = fields
-    const inputs = [...renderer.root.findAllByType('input'), ...renderer.root.findAllByType('textarea')]
-      .filter(input => fields.includes(input.props.name))
-    expect(inputs).toHaveLength(renderable.length)
-    expect(inputs.every(input => input.props.disabled === false)).toBe(true)
-    // 普通配置一个都不该变成输入框（否则保存必然被宿主拒绝）。
-    for (const key of plainFields) expect(renderer.root.findAllByProps({ name: key })).toHaveLength(0)
-    expect(renderedText(renderer)).toContain('普通配置（并发 / 二进制 / 超时）')
-    expect(renderedText(renderer)).toContain('maxConcurrentSessions')
-    await act(async () => {
-      for (const input of inputs) input.props.onChange({ target: input.props.type === 'checkbox'
-        ? { checked: !input.props.checked }
-        : { value: input.props.type === 'number' ? String(input.props.min ?? 0) : 'test-value' } })
-      modelControl(renderer, 'enabled', 'gemini-3-pro').props.onChange({ target: { checked: false } })
-      modelControl(renderer, 'effort', 'claude-sonnet-5-5').props.onChange({ target: { value: 'high' } })
-    })
-    expect(button(renderer, '保存').props.disabled).toBe(false)
+
+  it('opening settings and saving preferences leave login and discovery idle until requested', async () => {
+    const service = transport()
+    const control = controlWith()
+    const { renderer, intervals } = await mount(service.remote, control)
+    expect(intervals.size).toBe(0)
+    expect(control.mock.calls).toEqual([['account', { action: 'status' }], ['models', undefined]])
+    await act(async () => { fieldInput(renderer, 'reuseSessions').props.onChange({ target: { checked: false } }) })
     await act(async () => { await button(renderer, '保存').props.onClick() })
-    expect(service.mutate).toHaveBeenCalledTimes(1)
-    const ops = service.mutate.mock.calls[0]![1] as Array<{ path: string[]; value: unknown }>
-    expect(ops.map(op => op.path[0]).sort()).toEqual([...renderable, 'modelOverrides'].sort())
-    expect(ops.find(op => op.path[0] === 'modelOverrides')!.value).toEqual({
-      'claude-sonnet-5-5': { effort: 'high' },
-      'gemini-3-pro': { enabled: false },
+    expect(control).toHaveBeenCalledTimes(2)
+    await act(async () => { await button(renderer, '连接 / 登录 ACP').props.onClick() })
+    expect(control).toHaveBeenCalledWith('account', { action: 'login' })
+    await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
+    expect(control).toHaveBeenCalledWith('models', { force: true })
+  })
+
+  it('polls only read-only status during a pending connection and stops after cancellation', async () => {
+    let state = 'idle'
+    const control = vi.fn(async (method: string, request?: { action?: string; force?: boolean }) => {
+      if (method === 'models') return catalog()
+      if (request?.action === 'login') state = 'connecting'
+      if (request?.action === 'cancel') state = 'cancelled'
+      return { state, message: 'ACP' }
     })
-    expect(button(renderer, '保存').props.disabled, renderedText(renderer)).toBe(true)
-    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('test-value')
-    expect(fieldInput(renderer, 'cliQuotaEnabled').props.type).toBe('checkbox')
-    expect(renderedText(renderer)).toContain('已保存并切换模式')
+    const { renderer, intervals } = await mount(transport().remote, control)
+    await act(async () => { await button(renderer, '连接 / 登录 ACP').props.onClick() })
+    expect(intervals.size).toBe(1)
+    await act(async () => { for (const timer of intervals.values()) timer.callback() })
+    expect(control.mock.calls.at(-1)).toEqual(['account', { action: 'status' }])
+    await act(async () => { await button(renderer, '取消连接').props.onClick() })
+    expect(intervals.size).toBe(0)
+  })
+
+  it('保存栏常驻顶部，只提供一个保存入口，编辑和撤销更新未保存计数', async () => {
+    const service = transport(document())
+    const { renderer } = await mount(service.remote)
+    const bar = renderer.root.findByProps({ 'aria-label': '设置保存操作' })
+    expect(bar.props.style).toMatchObject({ position: 'sticky', top: 0, display: 'none' })
+    expect(bar.findAllByType('button').filter(node => node.children.join('') === '保存')).toHaveLength(1)
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    await act(async () => { fieldInput(renderer, 'idleRecycleMs').props.onChange({ target: { value: '12000' } }) })
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    expect(bar.props.style.display).toBe('grid')
+    expect(button(renderer, '保存').props.disabled).toBe(false)
+    await act(async () => { button(renderer, '撤销').props.onClick() })
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    expect(button(renderer, '保存').props.disabled).toBe(true)
   })
 
   it('逐模型设置只提交有意义的字段，清空的项从配置里移除', async () => {
@@ -542,17 +214,17 @@ describe('settings card with real React state and effects', () => {
   it('缺少设置 namespace 时解释禁用原因，宿主恢复后重新启用控件', async () => {
     const service = transport({ writable: true, namespaces: [] })
     const { renderer } = await mount(service.remote)
-    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(true)
+    expect(fieldInput(renderer, 'idleRecycleMs').props.disabled).toBe(true)
     expect(renderedText(renderer)).toContain('尚未提供 Antigravity ACP 的可编辑设置')
-    await act(async () => { service.change(document({ proxyUrl: 'http://restored:7890' })) })
-    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(false)
+    await act(async () => { service.change(document({ idleRecycleMs: 12000 })) })
+    expect(fieldInput(renderer, 'idleRecycleMs').props.disabled).toBe(false)
     expect(renderedText(renderer)).not.toContain('尚未提供 Antigravity ACP 的可编辑设置')
   })
 
   it('respects read-only settings instead of offering a save that will fail', async () => {
-    const service = transport(document({ proxyUrl: 'http://old:7890' }, 1, false))
+    const service = transport(document({ idleRecycleMs: 10000 }, 1, false))
     const { renderer } = await mount(service.remote, controlWith())
-    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(true)
+    expect(fieldInput(renderer, 'idleRecycleMs').props.disabled).toBe(true)
     expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.disabled).toBe(true)
     expect(button(renderer, '保存').props.disabled).toBe(true)
     expect(renderedText(renderer)).toContain('只读设置')
@@ -561,14 +233,14 @@ describe('settings card with real React state and effects', () => {
   })
 
   it('preserves edited fields and merges untouched fields after an external update', async () => {
-    const service = transport(document({ proxyUrl: 'http://old:7890', modelOverrides: { 'gemini-3-pro': { effort: 'low' } } }))
+    const service = transport(document({ idleRecycleMs: 10000, modelOverrides: { 'gemini-3-pro': { effort: 'low' } } }))
     const { renderer } = await mount(service.remote, controlWith())
     await act(async () => { modelControl(renderer, 'target', 'gemini-3-pro').props.onChange({ target: { value: 'custom-target' } }) })
-    // 外部同时改了代理和同一个模型的档位：草稿里的映射必须保留并提示冲突。
-    await act(async () => { service.change(document({ proxyUrl: 'http://new:7890', modelOverrides: { 'gemini-3-pro': { effort: 'high' } } }, 2)) })
+    // 外部同时改了回收时间和同一个模型的档位：草稿里的映射必须保留并提示冲突。
+    await act(async () => { service.change(document({ idleRecycleMs: 15000, modelOverrides: { 'gemini-3-pro': { effort: 'high' } } }, 2)) })
     expect(modelControl(renderer, 'target', 'gemini-3-pro').props.value).toBe('custom-target')
     expect(modelControl(renderer, 'effort', 'gemini-3-pro').props.value).toBe('low')
-    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('http://new:7890')
+    expect(fieldInput(renderer, 'idleRecycleMs').props.value).toBe(15000)
     expect(renderedText(renderer)).toContain('已保留你的输入')
     expect(renderedText(renderer)).toContain('模型列表设置')
     expect(renderedText(renderer)).toContain('1 项未保存')
@@ -580,9 +252,9 @@ describe('settings card with real React state and effects', () => {
     const first = deferred<SettingsDocument>()
     service.describe.mockImplementationOnce(() => first.promise)
     const { renderer } = await mount(service.remote, controlWith())
-    await act(async () => { service.change(document({ proxyUrl: 'http://latest:7890' }, 3)) })
-    await act(async () => { first.resolve(document({ proxyUrl: 'http://stale:7890' }, 1)) })
-    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('http://latest:7890')
+    await act(async () => { service.change(document({ idleRecycleMs: 30000 }, 3)) })
+    await act(async () => { first.resolve(document({ idleRecycleMs: 5000 }, 1)) })
+    expect(fieldInput(renderer, 'idleRecycleMs').props.value).toBe(30000)
     expect(button(renderer, '保存').props.disabled).toBe(true)
   })
 
@@ -598,85 +270,41 @@ describe('settings card with real React state and effects', () => {
     expect(service.mutate).not.toHaveBeenCalled()
   })
 
-  it('serializes save clicks and submits only edited fields, including a cleared value', async () => {
-    const service = transport(document({ proxyUrl: 'http://proxy:7890' }))
+  it('serializes save clicks and submits only edited fields, including zero', async () => {
+    const service = transport(document({ idleRecycleMs: 10000 }))
     const saved = deferred<{ ok: boolean; value: undefined }>()
     service.mutate.mockImplementationOnce(() => saved.promise)
     const { renderer } = await mount(service.remote, controlWith())
-    await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: '' } }) })
+    await act(async () => { fieldInput(renderer, 'idleRecycleMs').props.onChange({ target: { value: '0' } }) })
     const save = button(renderer, '保存').props.onClick as () => Promise<void>
     await act(async () => { void save(); void save() })
     expect(service.mutate).toHaveBeenCalledTimes(1)
-    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['proxyUrl'], value: '' }], 1)
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['idleRecycleMs'], value: 0 }], 1)
     expect(button(renderer, '保存中…').props.disabled).toBe(true)
-    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(true)
+    expect(fieldInput(renderer, 'idleRecycleMs').props.disabled).toBe(true)
     await act(async () => {
-      service.change(document({ proxyUrl: '' }, 2))
+      service.change(document({ idleRecycleMs: 0 }, 2))
       saved.resolve({ ok: true, value: undefined })
     })
-    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('')
+    expect(fieldInput(renderer, 'idleRecycleMs').props.value).toBe(0)
     expect(button(renderer, '保存').props.disabled).toBe(true)
     expect(renderedText(renderer)).not.toContain('项未保存的修改')
   })
 
   it('preserves the draft and refreshes the revision after a rejected mutation', async () => {
-    const service = transport(document({ proxyUrl: 'http://old:7890' }))
+    const service = transport(document({ idleRecycleMs: 10000 }))
     service.mutate.mockRejectedValueOnce(new Error('revision conflict'))
     const { renderer } = await mount(service.remote, controlWith())
-    await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: 'http://mine:7890' } }) })
-    service.set(document({ proxyUrl: 'http://other:7890' }, 2))
+    await act(async () => { fieldInput(renderer, 'idleRecycleMs').props.onChange({ target: { value: 20000 } }) })
+    service.set(document({ idleRecycleMs: 15000 }, 2))
     await act(async () => { await button(renderer, '保存').props.onClick() })
-    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('http://mine:7890')
+    expect(fieldInput(renderer, 'idleRecycleMs').props.value).toBe(20000)
     expect(renderedText(renderer)).toContain('revision conflict')
     expect(renderedText(renderer)).toContain('已保留你的输入')
     expect(button(renderer, '保存').props.disabled).toBe(false)
-    service.set(document({ proxyUrl: 'http://mine:7890' }, 3))
+    service.set(document({ idleRecycleMs: 20000 }, 3))
     await act(async () => { await button(renderer, '保存').props.onClick() })
     expect(service.mutate.mock.calls[1]?.[2]).toBe(2)
-  })
-
-  it('目录变化时刷新逐模型列表，手动列目录也能读到新条目', async () => {
-    const service = transport()
-    let revision = 1
-    const control = vi.fn(async (method: string, request?: { force?: boolean }) => {
-      if (method === 'account') return { state: 'idle', message: 'ready', runtime: { phase: 'ready', modelCatalogRevision: revision } }
-      if (request?.force) return { status: 'ok', models: [{ id: 'fresh-model', name: 'Fresh' }] }
-      return revision === 1 ? { status: 'ok', models: [] } : catalog()
-    })
-    const { renderer, intervals } = await mount(service.remote, control)
-    expect(renderedText(renderer)).toContain('暂无模型')
-    revision = 2
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
-    expect(modelControl(renderer, 'target', 'gemini-3-pro').props.value).toBe('')
-    expect(renderedText(renderer)).toContain('文本 · 图片')
-    await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
-    expect(modelControl(renderer, 'enabled', 'fresh-model')).toBeDefined()
-  })
-
-  it('后台目录通知不覆盖手动拉取的等待状态和失败原因，可再次点击重试', async () => {
-    const service = transport()
-    const pending = deferred<unknown>()
-    let revision = 1
-    let fail = true
-    const control = vi.fn(async (method: string, request?: { force?: boolean }) => {
-      if (method === 'account') return { state: 'idle', runtime: { modelCatalogRevision: revision } }
-      if (request?.force) return fail ? pending.promise : { status: 'ok', models: [{ id: 'new-model', name: 'New Model' }] }
-      return { status: 'ok', models: [{ id: 'old-model', name: 'Old Model' }] }
-    })
-    const { renderer, intervals } = await mount(service.remote, control)
-    await act(async () => { void button(renderer, '刷新模型目录').props.onClick() })
-    expect(renderedText(renderer)).toContain('正在拉取模型目录')
-    const calls = control.mock.calls.filter(([method]) => method === 'models').length
-    revision++
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
-    expect(control.mock.calls.filter(([method]) => method === 'models')).toHaveLength(calls)
-    expect(button(renderer, '正在刷新…').props.disabled).toBe(true)
-    await act(async () => { pending.resolve({ status: 'error', models: [{ id: 'old-model', name: 'Old Model' }], message: '目录拉取失败，请重试' }) })
-    expect(renderedText(renderer)).toContain('目录拉取失败，请重试')
-    expect(button(renderer, '刷新模型目录').props.disabled).toBe(false)
-    fail = false
-    await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
-    expect(modelControl(renderer, 'enabled', 'new-model')).toBeDefined()
   })
 
   it('shows session switches and submits timers as numbers, preserving zero', async () => {
@@ -720,7 +348,6 @@ describe('settings card with real React state and effects', () => {
     const { renderer, intervals } = await mount(service.remote, control)
     expect(renderedText(renderer)).toContain('运行 2 · 等待工具 1 · 排队 3')
     expect(button(renderer, '连接 / 登录 ACP').props.disabled).toBe(true)
-    expect(button(renderer, '立即预热').props.disabled).toBe(true)
     const before = service.describe.mock.calls.length
     await act(async () => { renderer.unmount() })
     expect(intervals.size).toBe(0)

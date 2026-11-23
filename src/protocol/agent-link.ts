@@ -41,8 +41,8 @@ import type {
   Stream,
 } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { ambientProxyEnv, buildProxyEnv } from '../runtime/proxy-env.js'
-import type { ProxySettings } from '../runtime/proxy-env.js'
+import { redactSensitiveText } from '../runtime/redact.js'
+import { ambientProxyEnv } from '../runtime/network-env.js'
 
 /** 本包原创协议层错误码（AGY_* 前缀命名体系）。 */
 export const AGY_LINK_ERROR = {
@@ -165,14 +165,14 @@ const DEFAULT_AUTH_TIMEOUT_MS = 5 * 60_000
  */
 function safeMessagePreview(message: unknown): string {
   try {
-    return JSON.stringify(message).slice(0, 200)
+    return redactSensitiveText(JSON.stringify(message)).slice(0, 200)
   } catch {
     return '<无法序列化的消息>'
   }
 }
 
 /** 官方 client 实现信息（initialize 上报）。 */
-export const AGY_CLIENT_INFO: Implementation = { name: 'dsh-bundle-antigravity-host', version: readPackageVersion() }
+export const AGY_CLIENT_INFO: Implementation = { name: 'dsh-bundle-antigravity-official-acp', version: readPackageVersion() }
 
 /** 读本包 package.json 的版本（src 与 dist 到它的相对路径一致）；读不到不影响启动。 */
 function readPackageVersion(): string {
@@ -380,9 +380,10 @@ export class AgentLink {
     clearTimeout(entry.timer)
     const failure = (response as { error?: { code: number; message: string; data?: unknown } }).error
     if (failure) {
+      const message = redactSensitiveText(failure.message)
       entry.reject(
-        new AgentLinkError(AGY_LINK_ERROR.AGENT_REFUSED, `ACP 请求被拒绝 (${entry.method}): ${failure.message}`, {
-          jsonRpc: { code: failure.code, message: failure.message, data: failure.data },
+        new AgentLinkError(AGY_LINK_ERROR.AGENT_REFUSED, `ACP 请求被拒绝 (${entry.method}): ${message}`, {
+          jsonRpc: { code: failure.code, message },
         }),
       )
       return
@@ -516,11 +517,12 @@ export class AgentLink {
    * 之后重放请求等于重新 spawn 一次官方进程并重新弹一次登录，**不可重试**，必须
    * 与普通请求超时在错误码上分开。
    */
-  async authenticate(methodId: AuthMethodId = OAUTH_PERSONAL_AUTH_METHOD): Promise<AuthenticateResponse> {
+  async authenticate(methodId: AuthMethodId = OAUTH_PERSONAL_AUTH_METHOD, signal?: AbortSignal): Promise<AuthenticateResponse> {
     this.#requireInitialized('authenticate')
     try {
-      return await this.request<AuthenticateResponse>('authenticate', { methodId }, { timeoutMs: this.#authTimeoutMs })
+      return await this.request<AuthenticateResponse>('authenticate', { methodId }, { timeoutMs: this.#authTimeoutMs, signal })
     } catch (error) {
+      signal?.throwIfAborted()
       if (error instanceof AgentLinkError && error.code === AGY_LINK_ERROR.REQUEST_TIMEOUT) {
         throw new AgentLinkError(
           AGY_LINK_ERROR.AUTH_TIMEOUT,
@@ -533,7 +535,7 @@ export class AgentLink {
   }
 
   /** 创建会话并保存会话 id。 */
-  async newSession(request: NewSessionRequest, options?: AgentLinkRequestOptions): Promise<NewSessionResponse> {
+  async newSession(request: NewSessionRequest, options?: AgentLinkRequestOptions & { allowAuthentication?: boolean }): Promise<NewSessionResponse> {
     this.#requireInitialized('session/new')
     /*
      * 只按**明确否定**拒绝。ACP v1 没有要求 agent 必须声明 `mcpCapabilities`，
@@ -557,7 +559,14 @@ export class AgentLink {
     try {
       response = await this.request<NewSessionResponse>('session/new', request, options)
     } catch (error) {
-      throw this.#withDiagnostics(error, options?.signal)
+      if (!(error instanceof AgentLinkError) || error.jsonRpc?.code !== -32000) throw this.#withDiagnostics(error, options?.signal)
+      if (!options?.allowAuthentication) {
+        throw new AgentLinkError('AGY_AUTH_REQUIRED', '官方 ACP 需要登录，请在设置中连接 Antigravity ACP')
+      }
+      const method = this.#initializeResponse?.authMethods?.find(item => item.id === OAUTH_PERSONAL_AUTH_METHOD)
+      if (!method) throw new AgentLinkError('AGY_AUTH_REQUIRED', '官方 ACP 未提供个人账户认证方式，请在运行 DSH 的主机上通过官方客户端登录')
+      await this.authenticate(method.id, options.signal)
+      response = await this.request<NewSessionResponse>('session/new', request, options)
     }
     this.#boundSessionId = response.sessionId
     return response
@@ -719,8 +728,6 @@ export function agentStreamFromSubprocess(handle: SubprocessHandle): Stream {
 export function officialAgentEnv(options: {
   binaryDir: string
   tmpDir: string
-  /** 出网代理；留空则不注入任何代理变量（官方进程直连）。 */
-  proxy?: ProxySettings | undefined
   parent?: NodeJS.ProcessEnv
 }): NodeJS.ProcessEnv {
   const parent = options.parent ?? process.env
@@ -755,9 +762,8 @@ export function officialAgentEnv(options: {
     if (value) env[key] = value
   }
   if (!env.SystemRoot && process.platform === 'win32') env.SystemRoot = 'C:\\Windows'
-  // 代理放在最后合并：用户配置优先；未配置时转发宿主自身的代理环境，避免出现
-  // 「宿主走代理、官方进程直连」的分裂路由（本机直连 Google 不通）。
-  Object.assign(env, options.proxy ? buildProxyEnv(options.proxy) : ambientProxyEnv(parent))
+  // Honor host transport settings while keeping private loopback traffic local.
+  Object.assign(env, ambientProxyEnv(parent))
   return env
 }
 
@@ -769,7 +775,6 @@ export function launchAcpAgent(
     extraArgs?: readonly string[]
     cwd?: string
     tmpDir: string
-    proxy?: ProxySettings | undefined
     signal?: AbortSignal
   },
 ): SubprocessHandle {
@@ -781,7 +786,7 @@ export function launchAcpAgent(
   return subprocess.spawn({
     argv: [executable, ...(options.extraArgs ?? [])],
     cwd,
-    env: officialAgentEnv({ binaryDir, tmpDir: options.tmpDir, proxy: options.proxy }),
+    env: officialAgentEnv({ binaryDir, tmpDir: options.tmpDir }),
     stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 64 * 1024 } },
     graceMs: 5_000,
     signal: options.signal,

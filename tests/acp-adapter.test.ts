@@ -102,7 +102,6 @@ function createHarness(
     onRecycleAttempt?: (count: number) => void
     loadCachedCatalog?: () => Promise<{ id: string; name: string; description?: string }[] | undefined>
     saveCatalog?: (models: readonly { id: string; name: string; description?: string }[]) => Promise<void> | void
-    loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
     readImage?: ImageReader
     canReadImages?: () => boolean
     imageCapability?: boolean
@@ -203,7 +202,6 @@ function createHarness(
     promptTimeoutMs: options.promptTimeoutMs,
     loadCachedCatalog: options.loadCachedCatalog,
     saveCatalog: options.saveCatalog,
-    loadCliCatalog: options.loadCliCatalog,
     readImage: options.readImage,
     canReadImages: options.canReadImages,
     reuseSessions: options.reuseSessions,
@@ -318,7 +316,7 @@ describe('模型目录来自 ACP 会话配置', () => {
     let modelOverrides: Record<string, ModelOverride> = { 'gemini-test': { enabled: false } }
     const harness = createHarness({
       readSettings: () => ({ modelOverrides }),
-      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
+      loadCachedCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
     })
     expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map(model => model.id)).toEqual(['claude-test'])
     modelOverrides = { 'gemini-test': { name: '改名后' } }
@@ -440,7 +438,7 @@ describe('模型目录来自 ACP 会话配置', () => {
   it('用户停用的模型不列入选择器，也不新增自造条目', async () => {
     const harness = createHarness({
       modelOverrides: { 'gemini-test': { enabled: false } },
-      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
+      loadCachedCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
     })
     expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((row) => row.id)).toEqual(['claude-test'])
     expect(harness.agent.requests).toHaveLength(0)
@@ -449,7 +447,7 @@ describe('模型目录来自 ACP 会话配置', () => {
   it('目录外的映射目标不作为模型新增，目录条目保持官方清单', async () => {
     const harness = createHarness({
       modelOverrides: { 'claude-test': { target: 'claude-test-high' } },
-      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
+      loadCachedCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
     })
     expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((row) => row.id)).toEqual(['gemini-test', 'claude-test'])
   })
@@ -457,7 +455,7 @@ describe('模型目录来自 ACP 会话配置', () => {
   it('显示名覆盖同时作用于目录与会话解析', async () => {
     const harness = createHarness({
       modelOverrides: { 'gemini-test': { name: '自定义名称' } },
-      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }],
+      loadCachedCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }],
     })
     expect((await harness.adapter.listModels(AGY_PROVIDER_ID))[0]?.name).toBe('自定义名称')
     expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-test')).name).toBe('自定义名称')
@@ -466,7 +464,7 @@ describe('模型目录来自 ACP 会话配置', () => {
   it('设置的默认档位成为该模型的 reasoning 缺省档位，未声明的档位退回官方默认', async () => {
     const harness = createHarness({
       modelOverrides: { 'claude-test': { effort: 'high' }, 'gemini-test': { effort: 'low' } },
-      loadCliCatalog: async () => [
+      loadCachedCatalog: async () => [
         { id: 'claude-test-low', name: 'Claude (Low)' },
         { id: 'claude-test-high', name: 'Claude (High)' },
         { id: 'gemini-test-medium', name: 'Gemini (Medium)' },
@@ -704,8 +702,8 @@ describe('模型目录来自 ACP 会话配置', () => {
 
   it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5 / Argon），不把思考强度放进模型', async () => {
     const harness = createHarness({
-      loadCachedCatalog: async () => [{ id: 'gemini-3-flash', name: 'Gemini 3 Flash' }],
-      loadCliCatalog: async () => [
+      loadCachedCatalog: async () => [
+        { id: 'gemini-3-flash', name: 'Gemini 3 Flash' },
         { id: 'gemini-3-flash', name: '重复条目以目录为准' },
         { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
         { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
@@ -726,17 +724,6 @@ describe('模型目录来自 ACP 会话配置', () => {
     // 同 id 时保留目录侧的名称。
     expect(models.find((model) => model.id === 'gemini-3-flash')?.name).toBe('Gemini 3 Flash')
     expect(models.find((model) => model.id === 'claude-opus-5-5')?.name).toBe('Claude Opus 5.5')
-  })
-
-  it('CLI 清单取数失败时目录主体不受影响', async () => {
-    const harness = createHarness({
-      loadCachedCatalog: async () => [{ id: 'gemini-3-pro', name: 'Gemini 3 Pro' }],
-      loadCliCatalog: async () => {
-        throw new Error('cli 不可用')
-      },
-    })
-    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
-    expect(models.map((model) => model.id)).toEqual(['gemini-3-pro'])
   })
 
   it('resolveModel 声明思考强度菜单（低/中/高），默认档位 medium', async () => {
@@ -761,11 +748,9 @@ describe('模型目录来自 ACP 会话配置', () => {
 
   it('思考强度路由：未选强度且家族档位已知时走默认档位 medium', async () => {
     const harness = createHarness({
-      loadCliCatalog: async () => [
-        { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
-        { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
-        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
-      ],
+      configOptions: [{ id: 'model', type: 'select', name: 'Model', category: 'model', currentValue: 'gemini-4-argon-low',
+        options: ['low', 'medium', 'high'].map(tier => ({ value: 'gemini-4-argon-' + tier, name: 'Gemini 4 Argon (' + tier + ')' })),
+      }],
     })
     const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-4-argon' })))
     await waitForRequest(harness.agent, 'session/set_config_option')
@@ -780,7 +765,7 @@ describe('模型目录来自 ACP 会话配置', () => {
   it('映射到官方 ID 时原样写入，优先于家族 + 档位路由', async () => {
     const harness = createHarness({
       modelOverrides: { 'gemini-4-argon': { target: 'gemini-4-argon-preview-x' } },
-      loadCliCatalog: async () => [
+      loadCachedCatalog: async () => [
         { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
         { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
       ],
@@ -799,7 +784,7 @@ describe('模型目录来自 ACP 会话配置', () => {
   it('默认思考档位设置决定未选强度时的路由结果', async () => {
     const harness = createHarness({
       modelOverrides: { 'gemini-4-argon': { effort: 'high' } },
-      loadCliCatalog: async () => [
+      loadCachedCatalog: async () => [
         { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
         { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
         { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
@@ -1073,11 +1058,11 @@ describe('不支持的请求项', () => {
 
 describe('模型元数据一致性', () => {
   it('仅导入目录、尚未列目录时也能解析家族名称与真实档位', async () => {
-    const loadCliCatalog = async () => [
+    const loadCachedCatalog = async () => [
       { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
       { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
     ]
-    const source = createHarness({ loadCliCatalog, configOptions: [
+    const source = createHarness({ loadCachedCatalog, configOptions: [
       { id: 'model', type: 'select', name: 'Model', category: 'model', currentValue: 'claude-opus-5-5-high', options: [
         { value: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
         { value: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
@@ -1103,7 +1088,7 @@ describe('模型元数据一致性', () => {
       { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
       { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
     ]
-    const fallback = createHarness({ loadCliCatalog: async () => [
+    const fallback = createHarness({ loadCachedCatalog: async () => [
       { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
     ] })
     await fallback.adapter.listModels(AGY_PROVIDER_ID)
@@ -2080,17 +2065,6 @@ describe('审查回归：取消、身份、目录和历史', () => {
     await replyWithText(harness, '当前回合未受影响')
     expect(visibleText(await streaming)).toBe('当前回合未受影响')
     expect(harness.recycles()).toBe(0)
-  })
-
-  it('CLI 非空缓存更新后下一次列目录能看到新型号', async () => {
-    let rows = [{ id: 'old-model', name: 'Old' }]
-    const loadCliCatalog = vi.fn(async () => rows)
-    const harness = createHarness({ loadCliCatalog })
-    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((m) => m.id)).toContain('old-model')
-    rows = [{ id: 'new-model', name: 'New' }]
-    const ids = (await harness.adapter.listModels(AGY_PROVIDER_ID)).map((m) => m.id)
-    expect(ids).toContain('new-model')
-    expect(ids).not.toContain('old-model')
   })
 
   it('历史重建保留工具关联及错误状态，正文含结束标签也能还原', async () => {

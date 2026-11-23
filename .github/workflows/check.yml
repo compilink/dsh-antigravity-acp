@@ -1,14 +1,14 @@
-name: Publish package
+name: Check private ACP fork
 
 on:
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
+  check:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -25,6 +25,3 @@ jobs:
 
       - name: Run CI checks
         run: npm run check
-
-      - name: Publish to npm with provenance
-        run: npm publish --provenance --access public

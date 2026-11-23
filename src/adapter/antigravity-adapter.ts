@@ -32,8 +32,8 @@ import {
   modelFamilyId,
   routeTieredModelId,
   tierForModelId,
-} from '../runtime/agy-cli.js'
-import type { AgyModelTier, AgyReasoningEffort } from '../runtime/agy-cli.js'
+} from './model-tiers.js'
+import type { AgyModelTier, AgyReasoningEffort } from './model-tiers.js'
 import { findModelSelector, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
 import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSettings, resolveModelTarget } from './model-settings.js'
@@ -55,7 +55,7 @@ export const AGY_PROVIDER_ID = 'antigravity-acp'
  * 旧会话里可能留下的占位路由 id（`server-default`）。
  *
  * 现在**不再广告**这条目录项：未观测到官方目录时目录可以为空（见
- * docs/reference.md），真实条目只在观测到 ACP 会话或 CLI 清单后出现。保留该
+ * docs/reference.md），真实条目只在观测到 ACP 会话后出现。保留该
  * 常量只为了识别历史会话/旧配置里的这个 id：命中且没有显式映射时不调用
  * session/set_config_option，沿用官方会话默认模型。
  */
@@ -82,7 +82,7 @@ export const AGY_ADAPTER_ERROR = {
 export interface AntigravityAcpAdapterOptions {
   lifecycle?: AcpLifecycle
   /**
-   * 惰性启动工厂：返回完成 initialize + authenticate 的 AgentLink。传入的
+   * 惰性启动工厂：返回完成 initialize 的 AgentLink。传入的
    * handlers 必须在整个 adapter 生命周期内保持**同一对象**——index.ts 会把
    * 首个 handler 集合固化到被缓存的 AgentLink 上，后续回合只更换其内部状态。
    */
@@ -113,11 +113,6 @@ export interface AntigravityAcpAdapterOptions {
   onMetadataChanged?: (metadata: AdapterMetadata) => void
   readImage?: ImageReader
   canReadImages?: () => boolean
-  /**
-   * 官方 CLI 模型清单（`agy models` 的只读取数，2026-10-16 授权仅限只读取数
-   * 用途）。用于补齐会话观测之外的官方型号；失败由 adapter 吞掉。
-   */
-  loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
   /**
    * 宿主日志（index.ts 接 `ctx.logger`）。仅用于**自诊断**：模型路由决策与
    * `session/set_config_option` 失败原因。缺省时不产任何日志。
@@ -171,7 +166,7 @@ export interface CachedModel {
 export interface AdapterMetadata {
   catalog: CachedModel[]
   contextWindows: Array<[string, number]>
-  /** 区分真实 ACP 档位观测与 CLI 家族兜底，避免弱快照覆盖完整目录。 */
+  /** 区分真实 ACP 档位观测与 已折叠的缓存目录，避免弱快照覆盖完整目录。 */
   catalogSource: 'acp' | 'fallback'
   imageSupported?: boolean
 }
@@ -236,7 +231,6 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #readSettings?: AntigravityAcpAdapterOptions['readSettings']
   readonly #loadCachedCatalog?: AntigravityAcpAdapterOptions['loadCachedCatalog']
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
-  readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
   readonly #log?: AdapterLog
   readonly #onMetadataChanged?: AntigravityAcpAdapterOptions['onMetadataChanged']
   #reuseSessions: boolean
@@ -261,15 +255,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #readImage?: ImageReader
   readonly #canReadImages?: () => boolean
   #imageSupported: boolean | undefined
-  /** 当前目录来源：ACP 原始档位观测优先于 CLI 家族兜底。 */
+  /** 当前目录来源：ACP 原始档位观测优先于 已折叠的缓存目录。 */
   #catalogSource: 'acp' | 'fallback' = 'fallback'
-  /** 仅其它 worker 的 CLI 家族目录，不能冒充当前 worker 的 ACP 观测。 */
+  /** 仅其它 worker 的已折叠目录，不能冒充当前 worker 的 ACP 观测。 */
   #fallbackCatalog: LlmModelInfo[] = []
-  /** 官方 CLI 清单的在途读取；完成即释放，底层负责缓存和后台刷新。 */
-  #cliCatalog?: Promise<readonly { id: string; name: string }[]>
   /** 家族 → 支持的思考强度档位（由目录折叠得到）。 */
   #familyTiers = new Map<string, ReadonlySet<AgyModelTier>>()
-  /** 防止异步 CLI 读取后的旧折叠结果覆盖较新的会话目录。 */
+  /** 防止异步缓存读取后的旧折叠结果覆盖较新的会话目录。 */
   #catalogFoldGeneration = 0
   /**
    * 最近一次家族折叠的结果（id → 折叠后的条目）。供 `resolveModel` 同步取
@@ -333,7 +325,6 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#readSettings = options.readSettings
     this.#loadCachedCatalog = options.loadCachedCatalog
     this.#saveCatalog = options.saveCatalog
-    this.#loadCliCatalog = options.loadCliCatalog
     this.#log = options.log
     this.#onMetadataChanged = options.onMetadataChanged
     this.#reuseSessions = options.reuseSessions ?? true
@@ -466,7 +457,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       const session = await link.newSession({
         cwd: this.#cwd, mcpServers: [],
         _meta: { antigravity: { enabledTools: [], eagerMcpServers: [] } },
-      }, { signal })
+      }, { signal, allowAuthentication: interactive })
       discoverySession = session.sessionId
       throwIfAborted(signal)
       if (!findModelSelector(session.configOptions)) throw llmError('ACP 会话未提供模型目录', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
@@ -537,31 +528,19 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     return { id: provider, name: 'Antigravity (ACP)' }
   }
 
-  /**
-   * 模型目录：只读**已观测**的 ACP 会话配置，绝不为了列目录而启动运行时。
-   *
-   * 依据已安装 SDK 1.4.0 的 d.ts：`InitializeResponse` 只有 protocolVersion /
-   * agentCapabilities / authMethods / agentInfo，**没有 configOptions**；模型
-   * 选择器出现在 `session/new` 响应、`session/set_config_option` 响应或
-   * `session/update(config_option_update)` 里。也就是说，ACP v1 没有任何
-   * 「无副作用即可读到模型目录」的方法；而启动运行时必然走
-   * `authenticate`（官方进程会自行弹浏览器）。
-   *
-   * 无真实目录时不再广告首次登录占位项；可在设置页显式连接 ACP 或拉取 CLI
-   * 目录。真实目录经 `observeSessionConfigOptions` 观测并缓存。
-   */
-  /**
-   * 本 provider 的模型目录：官方**家族**条目与用户配置的自定义 ID。
-   *
-   * 家族折叠（2026-10-16 用户指示）：官方把思考强度编码进模型 id
-   * （`claude-opus-5-5-{low,medium,high}`），但模型选择只出家族一行，强度由
-   * 思考强度菜单路由（见 #applyModelSelection）。会话观测目录与官方 CLI 清单
-   * 一并折叠，同 id 去重；被排除的家族（gpt-oss-120b 临近下架）不出现。
-   */
+  /** Returns observed or cached models without starting an agent. */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const folded = await this.#foldCatalog(_provider)
     // 用户设置只作用于已观测到的条目：停用的不列入选择器，显示名可覆盖。
-    const models = applyModelSettings(this.#modelSettingsSnapshot(), folded.models)
+    return this.#projectModelRows(_provider, applyModelSettings(this.#modelSettingsSnapshot(), folded.models))
+  }
+
+  async settingsModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const catalog = await this.#foldCatalog(provider)
+    return this.#projectModelRows(provider, catalog.models)
+  }
+
+  #projectModelRows(_provider: string, models: readonly { id: string; name: string; description?: string }[]): readonly LlmModelInfo[] {
     return [
       ...models.map((model) => ({
         provider: _provider,
@@ -575,7 +554,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /**
-   * 折叠家族档位表：会话观测目录（或磁盘缓存）+ 官方 CLI 清单。
+   * 折叠家族档位表：会话观测目录或磁盘缓存。
    * listModels 与模型路由共用；占位 id 不进家族表。
    */
   async #foldCatalog(provider: string): Promise<{
@@ -584,7 +563,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }> {
     const generation = ++this.#catalogFoldGeneration
     // 未观测到真实目录时用磁盘缓存兜住选择器空窗。
-    // 磁盘缓存来自 ACP 原始档位观测，优先于其它 worker 的 CLI 家族兜底。
+    // 磁盘缓存来自 ACP 原始档位观测，优先于其它 worker 的 已折叠的缓存目录。
     const cached = this.#catalog.length > 0 ? this.#catalog : await this.#cachedModels(provider)
     const source = cached.length > 0 ? cached : [...this.#fallbackCatalog]
     const folded = foldAgyModelFamilies([
@@ -595,37 +574,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           name: model.name,
           ...(model.description === undefined ? {} : { description: model.description }),
         })),
-      ...await this.#cliRawRows(),
     ])
-    // 目录可能在 CLI 缓存读取期间更新；旧折叠结果不能覆盖新观测。
+    // 目录可能在 缓存读取期间更新；旧折叠结果不能覆盖新观测。
     if (generation === this.#catalogFoldGeneration) {
       this.#familyTiers = folded.tiers
       this.#foldedFamilies = new Map(folded.models.map((model) => [model.id, model]))
     }
     return folded
-  }
-
-  /**
-   * 官方 CLI 模型清单的原始行（并发 single-flight；失败返回空）。
-   * 每次读取底层缓存的最新快照，不永久记忆非空旧结果，后台刷新才能可见。
-   */
-  async #cliRawRows(): Promise<readonly { id: string; name: string }[]> {
-    const load = this.#loadCliCatalog
-    if (!load) return []
-    this.#cliCatalog ??= (async () => {
-      try {
-        return await load()
-      } catch {
-        return []
-      }
-    })()
-    const inflight = this.#cliCatalog
-    try {
-      return await inflight
-    } finally {
-      // 只合并并发读取；底层目录可能已完成后台刷新，不能永久记住旧快照。
-      if (this.#cliCatalog === inflight) this.#cliCatalog = undefined
-    }
   }
 
   /** 读一次目录缓存（结果记忆在实例上，避免每次列目录都碰文件系统）。 */

@@ -454,7 +454,7 @@ describe('AgentLink 事件与会话', () => {
       if (message.method === 'initialize') {
         await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
       } else if (message.method === 'session/new') {
-        await reply({ jsonrpc: '2.0', id: message.id!, error: { code: -32000, message: 'auth required' } })
+        await reply({ jsonrpc: '2.0', id: message.id!, error: { code: -32603, message: 'internal error' } })
       }
     })
     const link = new AgentLink({ stream: pair.stream })
@@ -467,7 +467,7 @@ describe('AgentLink 事件与会话', () => {
     const error = caught as AgentLinkError
     expect(caught).toBeInstanceOf(AgentLinkError)
     expect(error.code).toBe(AGY_LINK_ERROR.AGENT_REFUSED)
-    expect(error.jsonRpc?.code).toBe(-32000)
+    expect(error.jsonRpc?.code).toBe(-32603)
     await link.close()
   })
 
@@ -600,57 +600,17 @@ describe('launchAcpAgent', () => {
     expect(env.SystemRoot).toBe('C:\\Windows')
   })
 
+  it('forwards the host transport settings with a loopback exception', () => {
+    const env = officialAgentEnv({ binaryDir: '/bin', tmpDir: '/tmp/agent', parent: { HTTPS_PROXY: 'https://proxy.example', NO_PROXY: 'example.test' } })
+    expect(env.HTTPS_PROXY).toBe('https://proxy.example')
+    expect(env.NO_PROXY?.split(',')).toEqual(expect.arrayContaining(['example.test', 'localhost', '127.0.0.1', '::1']))
+  })
+
   it('officialAgentEnv 未配置代理时不注入任何 *_PROXY 变量', () => {
     const env = officialAgentEnv({ binaryDir: 'D:\\bin', tmpDir: 'D:\\tmp\\agy', parent: {} })
     expect(Object.keys(env).filter((key) => key.toLowerCase().includes('proxy'))).toEqual([])
   })
 
-  it('officialAgentEnv 把代理写入大小写两套变量，loopback 始终绕过', () => {
-    const env = officialAgentEnv({
-      binaryDir: 'D:\\bin',
-      tmpDir: 'D:\\tmp\\agy',
-      proxy: { url: '127.0.0.1:7890' },
-      parent: { HTTP_PROXY: 'http://stale:1' },
-    })
-    expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:7890')
-    expect(env.https_proxy).toBe('http://127.0.0.1:7890')
-    expect(env.NO_PROXY).toBe('localhost,127.0.0.1,::1')
-    expect(env.TEMP).toBe('D:\\tmp\\agy')
-  })
-
-  it('launchAcpAgent 把代理透传给子进程 env', () => {
-    const specs: unknown[] = []
-    const subprocess = {
-      spawn: (spec: unknown) => {
-        specs.push(spec)
-        return { stdin: {}, stdout: {}, collected: { stderr: { readFrom: () => ({ text: '' }) } }, terminate: () => undefined }
-      },
-    }
-    launchAcpAgent(subprocess as never, {
-      executable: process.platform === 'win32' ? 'D:\\cache\\agy_acp_server.exe' : '/cache/agy_acp_server.exe',
-      tmpDir: 'D:\\tmp\\agy',
-      proxy: { url: 'http://127.0.0.1:7890', bypass: '10.0.0.0/8' },
-    })
-    const spec = specs[0] as { env: Record<string, string> }
-    expect(spec.env.HTTPS_PROXY).toBe('http://127.0.0.1:7890')
-    expect(spec.env.NO_PROXY).toBe('10.0.0.0/8,localhost,127.0.0.1,::1')
-  })
-
-  it('代理地址非法时 launchAcpAgent 就地抛出，不 spawn', () => {
-    let spawned = false
-    const subprocess = {
-      spawn: () => {
-        spawned = true
-        return { stdin: {}, stdout: {}, terminate: () => undefined }
-      },
-    }
-    expect(() => launchAcpAgent(subprocess as never, {
-      executable: process.platform === 'win32' ? 'D:\\cache\\agy_acp_server.exe' : '/cache/agy_acp_server.exe',
-      tmpDir: 'D:\\tmp\\agy',
-      proxy: { url: 'ftp://127.0.0.1:21' },
-    })).toThrow()
-    expect(spawned).toBe(false)
-  })
 })
 
 describe('AgentLink 请求写出失败', () => {

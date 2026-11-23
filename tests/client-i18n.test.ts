@@ -33,7 +33,7 @@ describe('client i18n', () => {
   const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]!).sort()
 
   it('每条中文界面文案都有英文翻译（console 日志除外）', () => {
-    const missing = literals(source.slice(source.indexOf('/* @include'))).filter((text) => !(text in EN_MESSAGES) && !text.startsWith('[dsh-bundle'))
+    const missing = literals(source.slice(source.indexOf('const PROVIDER'))).filter((text) => !(text in EN_MESSAGES) && !text.startsWith('[dsh-bundle'))
     expect(missing).toEqual([])
   })
 

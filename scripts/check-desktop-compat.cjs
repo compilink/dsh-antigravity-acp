@@ -38,35 +38,29 @@ async function main() {
       return next(context.parentURL?.startsWith(dist) && peers.has(specifier) ? host(specifier) : specifier, context)
     },
   })
-  const [{ Context }, { default: Llm, LlmError }, { default: Typert }, bundle, router, { llmError }] = await Promise.all([
+  const [{ Context }, { default: Llm, LlmError }, { default: Typert }, bundle, { llmError }] = await Promise.all([
     import(host('@deepseek-ai/cordis')),
     import(host('@deepseek-ai/dsh-llm')),
     import(host('@deepseek-ai/dsh-typert-registry')),
     import(dist + 'index.js'),
-    import(dist + 'proxy/index.js'),
     import(dist + 'runtime/llm-error.js'),
   ])
   const scratch = fs.mkdtempDisposableSync(path.join(fs.realpathSync(tmpdir()), 'dsh-agy-compat-'))
   // Applying the Host prunes its stale cache and runtime directories; use fresh roots.
   process.env.DSH_HOME = path.join(scratch.path, 'profile')
   process.env.AGY_ACP_HOME = path.join(scratch.path, 'install')
-  // Background quota refresh must not discover the user's official CLI login.
   process.env.USERPROFILE = process.env.HOME = path.join(scratch.path, 'home')
   const ctx = new Context()
   const typertFiber = ctx.plugin(Typert)
   const llmFiber = ctx.plugin(Llm)
   ctx.provide('subprocess', { spawn() { assert.fail('Unexpected subprocess') } })
-  // Start in proxy mode without warmup or binary prefetch; update through the same event as the Loader.
-  const config = { proxyMode: true }
-  let hostFiber, routerFiber
+  let hostFiber
   try {
     await Promise.all([typertFiber.inertia, llmFiber.inertia])
-    hostFiber = ctx.plugin({ inject: ['llm', 'subprocess'], apply(scope) { bundle.apply(scope, config) } })
+    hostFiber = ctx.plugin({ inject: ['llm', 'subprocess'], apply(scope) { bundle.apply(scope, {}) } })
     await hostFiber.inertia
-    routerFiber = ctx.plugin(router)
-    await routerFiber.inertia
     const providers = () => ctx.llm.listProviders().map(({ id }) => id)
-    assert.deepEqual(providers(), ['antigravity-proxy'])
+    assert.deepEqual(providers(), ['antigravity-acp'])
     assert.equal(ctx.typert.listPackages().filter(({ package: name }) => name === manifest.name).length, 1)
 
     const cause = new Error('fixture cause')
@@ -75,23 +69,13 @@ async function main() {
     assert.deepEqual(failure.failure, { message: 'fixture diagnostic', code: 'AGY_LINK_CLOSED', status: 503, providerRetryAfterMs: 50 })
     assert.equal(failure.cause, cause)
 
-    config.proxyMode = false
-    ctx.emit('loader/volatile-update', [['proxyMode']])
-    assert.deepEqual(providers(), ['antigravity-acp'])
-    config.proxyMode = true
-    ctx.emit('loader/volatile-update', [['proxyMode']])
-    assert.deepEqual(providers(), ['antigravity-proxy'])
-
-    await routerFiber.dispose()
-    routerFiber = undefined
-    assert.deepEqual(providers(), [])
     await hostFiber.dispose()
     hostFiber = undefined
+    assert.deepEqual(providers(), [])
     assert.equal(ctx.typert.getPackage(manifest.name, 'host'), undefined)
     console.log(`PASS: ${readManifest(installDir).version} / DSH ${readManifest(path.join(modules, '@deepseek-ai/dsh')).version}, peer ranges, LLM routes, Typert registration and cleanup, custom failures`)
   } finally {
     try {
-      await routerFiber?.dispose()
       await hostFiber?.dispose()
       await llmFiber.dispose()
       await typertFiber.dispose()

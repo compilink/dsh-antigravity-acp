@@ -144,7 +144,7 @@ export class FakeAcpAgent {
             void this.#write({
               jsonrpc: '2.0',
               id: record.id,
-              error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
+              error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
             })
           },
         )

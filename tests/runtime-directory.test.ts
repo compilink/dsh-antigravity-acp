@@ -56,12 +56,12 @@ describe('isolated ACP runtime directory', () => {
   })
 })
 
-describe('manual executable escape hatch', () => {
-  it('accepts an explicit binary before rejecting unknown download platforms', async () => {
-    const root = await makeRoot()
-    const path = join(root, 'custom-agent')
+describe('executable provenance', () => {
+  it('rejects overrides before checking the download platform or executing any file', async () => {
+    const path = join(await makeRoot(), 'custom-agent')
     await writeFile(path, 'test fixture')
-    await expect(ensureAgentBinary({ binaryPath: path, platform: 'freebsd', arch: 'riscv64', env: {} })).resolves.toMatchObject({ source: 'config', executablePath: path })
-    await expect(ensureAgentBinary({ platform: 'freebsd', arch: 'riscv64', env: { AGY_ACP_BIN: path } })).resolves.toMatchObject({ source: 'env', executablePath: path })
+    for (const override of [{ binaryPath: path }, { env: { AGY_ACP_BIN: path } }, { env: { AGY_ACP_URL: 'https://dl.google.com/other.zip' } }]) {
+      await expect(ensureAgentBinary({ platform: 'freebsd', arch: 'riscv64', ...override })).rejects.toMatchObject({ code: 'AGY_BINARY_UNVERIFIED' })
+    }
   })
 })

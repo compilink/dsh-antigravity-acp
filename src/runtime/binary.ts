@@ -1,19 +1,17 @@
 /**
  * 官方 Antigravity ACP server 二进制的解析与获取。
  *
- * 解析顺序：config.binaryPath → 环境变量 AGY_ACP_BIN → 缓存目录中已下载
- * 版本 → 自动下载到缓存。所有副作用集中在文件底部的过程函数；纯函数
- * （URL 拼接、URL 校验、zip 条目校验、可执行文件挑选、缓存路径）单独导出，
- * 便于单元测试。
+ * 每次启动从经 SHA-256 验证的官方归档解压到独占目录。缓存只提供归档字节。
  */
-import { createWriteStream } from 'node:fs'
-import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
+import { constants, createReadStream, createWriteStream } from 'node:fs'
+import { access, chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
 import { homedir as osHomedir, tmpdir } from 'node:os'
 import { dirname, join, normalize, resolve, sep, win32 } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import yauzl from 'yauzl'
+import { officialArchiveDigest } from './official-release.js'
 
 /** 默认下载的官方 server 版本（可经 config.acpVersion 配置）。 */
 export const DEFAULT_ACP_SERVER_VERSION = '1.5.2'
@@ -52,6 +50,7 @@ export const INSTALL_ROOT_ENV = 'AGY_ACP_HOME'
 export const AGY_BINARY_ERROR = {
   /** URL 不满足 https + dl.google.com 白名单。 */
   BLOCKED_URL: 'AGY_DOWNLOAD_BLOCKED',
+  UNVERIFIED: 'AGY_BINARY_UNVERIFIED',
   /** 服务器返回 3xx 重定向；安全策略要求拒绝且不跟随。 */
   REDIRECT_REFUSED: 'AGY_DOWNLOAD_REDIRECT_REFUSED',
   /** 下载返回非 2xx（非 3xx）状态。 */
@@ -191,6 +190,20 @@ export async function downloadBinary(
   return new Uint8Array(await response.arrayBuffer())
 }
 
+/** Compressed input is bounded before ZIP inspection or extraction. */
+export const MAX_ARCHIVE_BYTES = 1_536 * 1_024 * 1_024
+
+function limitArchiveSize(): Transform {
+  let bytes = 0
+  return new Transform({
+    transform(chunk: Buffer, _encoding, next) {
+      bytes += chunk.length
+      if (bytes > MAX_ARCHIVE_BYTES) next(new AgyBinaryError(AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE, '官方归档超出下载大小上限'))
+      else next(null, chunk)
+    },
+  })
+}
+
 /**
  * 流式下载二进制并直接写入指定文件路径。
  * 若 response.body 提供可读流则以管道直写，避免将 ~100MB 的 zip 整包载入 V8 堆内存；
@@ -205,11 +218,12 @@ export async function downloadBinaryToFile(
   if (response.body && typeof Readable.fromWeb === 'function') {
     try {
       const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0])
-      await pipeline(nodeStream, createWriteStream(destPath))
+      await pipeline(nodeStream, limitArchiveSize(), createWriteStream(destPath, { flags: 'wx', mode: 0o600 }))
       return
     } catch (error) {
       // body 已经被流式读取消费，再调 `response.arrayBuffer()` 只会抛
       // 「Body is unusable」，把断网/超时/写盘失败的真实原因盖掉。直接上报。
+      if (error instanceof AgyBinaryError) throw error
       throw new AgyBinaryError(
         AGY_BINARY_ERROR.TRANSFER_FAILED,
         `下载中断（${url}）：${error instanceof Error ? error.message : String(error)}`,
@@ -219,7 +233,8 @@ export async function downloadBinaryToFile(
   }
   // 没有可读流（测试替身或探针响应）时才走整包读取。
   const bytes = new Uint8Array(await response.arrayBuffer())
-  await writeFile(destPath, bytes)
+  if (bytes.byteLength > MAX_ARCHIVE_BYTES) throw new AgyBinaryError(AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE, '官方归档超出下载大小上限')
+  await writeFile(destPath, bytes, { flag: 'wx', mode: 0o600 })
 }
 
 /**
@@ -326,7 +341,7 @@ export function resolveCacheDir(
  *
  * 因此安装根默认取用户级应用数据目录（Windows: `%LOCALAPPDATA%`；
  * POSIX: `$XDG_CACHE_HOME` 或 `~/.cache`），它们不在 Low 标签树内。
- * 可用 `AGY_ACP_HOME` 或配置项 `binaryPath` 覆盖。
+ * `AGY_ACP_HOME` 用于指定私有安装根目录。
  */
 export function resolveInstallRoot(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -340,14 +355,14 @@ export function resolveInstallRoot(
     if (localAppData) return win32.join(localAppData, INSTALL_DIR_NAME)
     const profile = env.USERPROFILE?.trim()
     if (profile) return win32.join(profile, 'AppData', 'Local', INSTALL_DIR_NAME)
-    return win32.join(tmpdir(), INSTALL_DIR_NAME)
+    throw new AgyBinaryError(AGY_BINARY_ERROR.UNVERIFIED, '缺少私有安装目录，请设置 AGY_ACP_HOME')
   }
   const xdgCache = env.XDG_CACHE_HOME?.trim()
   if (xdgCache) return join(xdgCache, INSTALL_DIR_NAME)
   try {
     return join(homedir(), '.cache', INSTALL_DIR_NAME)
   } catch {
-    return join(tmpdir(), INSTALL_DIR_NAME)
+    throw new AgyBinaryError(AGY_BINARY_ERROR.UNVERIFIED, '缺少私有安装目录，请设置 AGY_ACP_HOME')
   }
 }
 
@@ -529,8 +544,7 @@ export async function cleanupStaleStagingDirs(
 
 /**
  * Node 的 process.platform / process.arch → 下载坐标映射。
- * 未映射组合抛 AGY_PLATFORM_UNSUPPORTED（用户可用 binaryPath/AGY_ACP_BIN
- * 或 AGY_ACP_URL 覆盖，而不是让我们猜测 URL）。
+ * 未登记的平台或架构无法解析到可信发行包。
  */
 export function mapNodePlatform(platform: NodeJS.Platform, arch: string): { platform: AcpPlatform; arch: AcpArch } {
   const mappedPlatform: AcpPlatform | undefined =
@@ -539,7 +553,7 @@ export function mapNodePlatform(platform: NodeJS.Platform, arch: string): { plat
   if (!mappedPlatform || !mappedArch) {
     throw new AgyBinaryError(
       AGY_BINARY_ERROR.PLATFORM_UNSUPPORTED,
-      `未知平台组合 ${platform}/${arch}；请用 binaryPath 或 AGY_ACP_BIN 手动指定二进制`,
+      `未知平台组合 ${platform}/${arch}；此平台没有可验证的官方发行包`,
     )
   }
   return { platform: mappedPlatform, arch: mappedArch }
@@ -702,144 +716,125 @@ export async function extractZipSafely(zipPath: string, destDir: string, limits:
 }
 
 export interface AgentBinaryResolution {
-  /** 可直接交给 ctx.subprocess 的可执行文件路径。 */
   executablePath: string
-  /** 命中来源：手动配置 / 环境变量 / 缓存 / 自动下载。 */
-  source: 'config' | 'env' | 'cache' | 'download'
-  /** 下载缓存中的版本号（手动路径时为 undefined）。 */
-  version?: string
-  /** 官方未提供校验和，这里永远如实为 false，不得伪造为 true。 */
-  checksumVerified: false
+  source: 'cache' | 'download'
+  version: string
+  checksumVerified: true
+  /** Release only when the spawned agent and its helpers have exited. */
+  release(): Promise<void>
 }
 
 export interface AgentBinaryOptions {
-  /** 用户显式配置的二进制路径，最高优先级。 */
+  /** Legacy configuration is rejected explicitly to avoid executing unsigned local files. */
   binaryPath?: string
-  /** 是否允许自动下载（默认 true）。 */
   autoDownload?: boolean
-  /** 目标版本（默认 1.5.2）。 */
   version?: string
-  /** 下载 URL 覆盖（未验证平台组合的逃生门；仍受域名白名单约束）。 */
   downloadUrl?: string
   fetchImpl?: FetchLike
   signal?: AbortSignal
   env?: Readonly<Record<string, string | undefined>>
-  /** 安装根目录覆盖；默认 {@link resolveInstallRoot}（**不是** DSH home）。 */
   cacheDir?: string
-  /** 平台覆写供离线发行表测试；正常调用使用 process.platform/arch。 */
   platform?: NodeJS.Platform
   arch?: string
 }
 
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path)
-    return true
-  } catch {
-    return false
-  }
-}
-
-async function findExtractedExecutable(extractDir: string, flavor: ExecutableFlavor): Promise<string | undefined> {
-  if (!(await fileExists(extractDir))) return undefined
-  // 扫描解压目录（浅层递归足够：官方 zip 最多一层目录）。
-  const walk = async (dir: string, prefix: string): Promise<string[]> => {
-    const items = await readdir(dir, { withFileTypes: true })
-    const files: string[] = []
-    for (const item of items) {
-      const rel = prefix ? `${prefix}/${item.name}` : item.name
-      if (item.isDirectory()) files.push(...(await walk(join(dir, item.name), rel)))
-      else files.push(rel)
+/** The runtime root must not allow another local user to substitute a launch directory. */
+async function preparePrivateRoot(path: string): Promise<string> {
+  await mkdir(path, { recursive: true, mode: 0o700 })
+  const canonical = await realpath(path)
+  const uid = process.getuid?.()
+  if (uid !== undefined) {
+    // Walk canonical parents as well. A sticky shared ancestor (e.g. /tmp) protects a user-owned entry.
+    for (let current = canonical;; current = dirname(current)) {
+      const info = await lstat(current)
+      const trustedOwner = info.uid === uid || info.uid === 0
+      const writableByOthers = (info.mode & 0o022) !== 0
+      const stickyAncestor = current !== canonical && (info.mode & 0o1000) !== 0
+      if (!info.isDirectory() || !trustedOwner || (writableByOthers && !stickyAncestor)) {
+        throw new AgyBinaryError(AGY_BINARY_ERROR.UNVERIFIED, '官方 ACP 运行目录或其父目录允许其他用户修改')
+      }
+      if (dirname(current) === current) break
     }
-    return files
   }
-  const entries = await walk(extractDir, '')
+  return canonical
+}
+
+/** Copy untrusted cache bytes into a private file before hashing and opening them as a ZIP. */
+async function snapshotCachedArchive(path: string, dest: string, signal?: AbortSignal): Promise<boolean> {
+  const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (!file) return false
   try {
-    const relative = pickExecutablePath(entries, flavor)
-    return join(extractDir, relative)
-  } catch {
-    return undefined
+    const info = await file.stat()
+    if (!info.isFile() || info.size > MAX_ARCHIVE_BYTES) {
+      throw new AgyBinaryError(AGY_BINARY_ERROR.UNVERIFIED, '归档缓存不是大小允许的普通文件')
+    }
+    await pipeline(file.createReadStream({ autoClose: false }), limitArchiveSize(),
+      createWriteStream(dest, { flags: 'wx', mode: 0o600 }), { signal })
+    return true
+  } finally {
+    await file.close()
   }
 }
 
-/**
- * 完整解析顺序。下载阶段：先落 `<versionDir>/agy-acp-server.zip.tmp`，
- * 成功后原子重命名，失败清理临时残留；解压先在临时目录进行，全部成功
- * 后重命名进 extract 目录，保证缓存状态始终自洽。
- */
+async function verifyArchive(path: string, expected: string, signal?: AbortSignal): Promise<void> {
+  const hash = createHash('sha256')
+  await pipeline(createReadStream(path), hash, { signal })
+  if (hash.digest('hex') !== expected) {
+    throw new AgyBinaryError(AGY_BINARY_ERROR.UNVERIFIED, '官方 ACP 归档 SHA-256 不匹配，已拒绝启动；请替换或移除损坏的 ZIP 缓存')
+  }
+}
+
+/** Verify the entire platform archive and materialize a fresh private copy of every executable for this launch. */
 export async function ensureAgentBinary(options: AgentBinaryOptions = {}): Promise<AgentBinaryResolution> {
   const env = options.env ?? process.env
+  if (options.binaryPath?.trim() || env.AGY_ACP_BIN?.trim() || options.downloadUrl?.trim() || env.AGY_ACP_URL?.trim()) {
+    throw new AgyBinaryError(AGY_BINARY_ERROR.UNVERIFIED, '仅接受已登记的官方 ACP 归档，禁止自定义可执行文件或下载地址')
+  }
   const version = options.version ?? DEFAULT_ACP_SERVER_VERSION
-  // 安装根目录取用户级应用数据目录，**不是** DSH home：后者带 Low 完整性标签，
-  // 会把进程降成 LOW 并导致 session/new 静默挂死（见 resolveInstallRoot 注释）。
-  const cacheDir = options.cacheDir ?? resolveInstallRoot(env)
-  if (options.binaryPath && options.binaryPath.trim().length > 0) {
-    if (!(await fileExists(options.binaryPath))) {
-      throw new AgyBinaryError(AGY_BINARY_ERROR.BINARY_MISSING, `config.binaryPath 不存在: ${options.binaryPath}`)
-    }
-    return { executablePath: resolve(options.binaryPath), source: 'config', checksumVerified: false }
-  }
-
-  const envPath = env.AGY_ACP_BIN
-  if (envPath && envPath.trim().length > 0) {
-    if (!(await fileExists(envPath))) {
-      throw new AgyBinaryError(AGY_BINARY_ERROR.BINARY_MISSING, `环境变量 AGY_ACP_BIN 指向的文件不存在: ${envPath}`)
-    }
-    return { executablePath: resolve(envPath), source: 'env', checksumVerified: false }
-  }
-
   const { platform, arch } = mapNodePlatform(options.platform ?? process.platform, options.arch ?? process.arch)
-  const flavor: ExecutableFlavor = platform === 'windows' ? 'windows' : 'posix'
-
-  const { versionDir, extractDir } = versionCachePaths(cacheDir, version)
-  const cached = await findExtractedExecutable(extractDir, flavor)
-  if (cached) {
-    await ensureExecutable(cached, flavor)
-    return { executablePath: cached, source: 'cache', version, checksumVerified: false }
-  }
-
-  const autoDownload = options.autoDownload ?? true
-  if (!autoDownload) {
-    throw new AgyBinaryError(
-      AGY_BINARY_ERROR.BINARY_MISSING,
-      `未找到 ACP server 二进制（binaryPath 未配置、AGY_ACP_BIN 未设置、缓存无 ${version} 版本）且 autoDownload=false`,
-    )
-  }
-
-  // URL 覆盖仅供未验证平台组合使用；无论来源都过域名白名单。
-  const url = options.downloadUrl ?? env.AGY_ACP_URL ?? resolveDownloadUrl(platform, arch, version)
-  await mkdir(versionDir, { recursive: true })
-  const staging = await mkdtemp(join(versionDir, '.staging-'))
-  const zipTmp = join(staging, 'agy-acp-server.zip.tmp')
+  const expected = officialArchiveDigest(version, platform, arch)
+  if (!expected) throw new AgyBinaryError(AGY_BINARY_ERROR.UNVERIFIED, '此 ACP 版本尚无已登记的 SHA-256')
+  const cacheDir = await preparePrivateRoot(options.cacheDir ?? resolveInstallRoot(env))
+  const { versionDir } = versionCachePaths(cacheDir, version)
+  const versionRoot = await preparePrivateRoot(versionDir)
+  const runRoot = await preparePrivateRoot(join(cacheDir, 'runtime'))
+  const cache = join(versionRoot, `official-${platform}-${arch}.zip`)
+  const lease = await createRuntimeDirectory({ root: runRoot })
+  const archive = join(lease.path, 'release.zip')
+  const release = () => releaseRuntimeDirectory(lease)
   try {
-    await writeDirectoryOwner(staging)
-    await downloadBinaryToFile(url, zipTmp, { fetchImpl: options.fetchImpl, signal: options.signal })
-    const stagingExtract = join(staging, 'extract')
-    await mkdir(stagingExtract, { recursive: true })
-    const entries = await extractZipSafely(zipTmp, stagingExtract)
-    const relative = pickExecutablePath(entries, flavor)
-    const finalExtract = extractDir
-    try {
-      await rename(stagingExtract, finalExtract)
-    } catch (error) {
-      // 另一个宿主可能刚提交了同版本；不得删除它正在使用的完整产物。
-      const winner = await findExtractedExecutable(finalExtract, flavor)
-      if (winner) {
-        await ensureExecutable(winner, flavor)
-        return { executablePath: winner, source: 'cache', version, checksumVerified: false }
+    const cached = await snapshotCachedArchive(cache, archive, options.signal)
+    if (!cached) {
+      if (options.autoDownload === false) {
+        throw new AgyBinaryError(AGY_BINARY_ERROR.BINARY_MISSING, '未找到官方 ZIP 缓存且已禁用自动下载')
       }
-      // 只有「目标已存在」这一类可自愈的失败才清掉旧目录重试：权限、跨设备
-      // 重命名、路径过长等错误把目录删掉再重试只会吞掉真实原因。
-      const code = (error as NodeJS.ErrnoException | null)?.code
-      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') throw error
-      await rm(finalExtract, { recursive: true, force: true })
-      await rename(stagingExtract, finalExtract)
+      await downloadBinaryToFile(resolveDownloadUrl(platform, arch, version), archive, options)
     }
-    const executablePath = join(finalExtract, relative)
-    await ensureExecutable(executablePath, flavor)
-    return { executablePath, source: 'download', version, checksumVerified: false }
-  } finally {
-    // 失败/成功都要清掉暂存残渣（zip 临时文件与可能的半成品）。
-    await rm(staging, { recursive: true, force: true }).catch(() => undefined)
+    await verifyArchive(archive, expected, options.signal)
+    const extracted = join(lease.path, 'bin')
+    await mkdir(extracted, { mode: 0o700 })
+    const entries = await extractZipSafely(archive, extracted)
+    options.signal?.throwIfAborted()
+    const entry = ACP_DISTRIBUTIONS[platform].executable
+    if (!entries.includes(entry)) throw new AgyBinaryError(AGY_BINARY_ERROR.ARCHIVE_LAYOUT, '官方 ACP 归档缺少已登记的入口')
+    const executablePath = join(extracted, entry)
+    await ensureExecutable(executablePath, platform === 'windows' ? 'windows' : 'posix')
+    if (cached) await rm(archive)
+    else {
+      // Concurrent publishers only publish complete verified archives. Each launch uses its own extracted files.
+      await rename(archive, cache).catch(async (error: NodeJS.ErrnoException) => {
+        if (error.code !== 'EEXIST' && error.code !== 'EPERM') throw error
+        const winner = await lstat(cache).catch(() => undefined)
+        if (!winner?.isFile()) throw error
+        await rm(archive)
+      })
+    }
+    return { executablePath, source: cached ? 'cache' : 'download', version, checksumVerified: true, release }
+  } catch (error) {
+    await release()
+    throw error
   }
 }

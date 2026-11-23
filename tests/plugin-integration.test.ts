@@ -3,12 +3,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import type { AntigravityAcpAdapterOptions } from '../src/adapter/antigravity-adapter.js'
-import type { SettingsControl } from '../src/quota/control.js'
+import type { SettingsControl } from '../src/settings/control.js'
 import { PooledAcpAdapter } from '../src/pool/pooled-adapter.js'
 import { apply } from '../src/index.js'
 import { isVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { Config } from '../src/settings.js'
-import type { ProxyModeBus } from '../src/proxy/mode-bus.js'
 
 interface WorkerStub {
   options: AntigravityAcpAdapterOptions
@@ -20,10 +19,6 @@ interface WorkerStub {
 const external = vi.hoisted(() => ({
   workers: [] as WorkerStub[],
   events: [] as string[],
-  fetchRoutes: [] as Array<() => { url: string; bypass: string } | undefined>,
-  fetch: vi.fn(async () => { throw new Error('Unexpected network request') }),
-  fetchClose: vi.fn(async () => {}),
-  cli: vi.fn(async () => { throw new Error('Unexpected CLI invocation') }),
   download: vi.fn(async () => { throw new Error('Unexpected binary startup') }),
 }))
 
@@ -35,25 +30,11 @@ vi.mock('../src/runtime/binary.js', async (original) => ({
   resolveInstallRoot: () => '/fake/install',
   ensureAgentBinary: external.download,
 }))
-// 代理解析保持真实实现：装载期对非法代理的容错本身是被测行为（见下方用例）。
-vi.mock('../src/runtime/proxy-env.js', async (original) => ({
-  ...await original<typeof import('../src/runtime/proxy-env.js')>(),
-}))
-vi.mock('../src/runtime/proxied-fetch.js', async (original) => ({
-  ...await original<typeof import('../src/runtime/proxied-fetch.js')>(),
-  createLiveProxiedFetch: (readProxy: () => { url: string; bypass: string } | undefined) => {
-    external.fetchRoutes.push(readProxy)
-    return Object.assign(external.fetch, { close: external.fetchClose })
-  },
-}))
-vi.mock('../src/runtime/agy-cli.js', () => ({
-  agyCliCandidates: () => [], createSubprocessCliRun: () => external.cli, fetchAgyModels: external.cli,
-}))
 vi.mock('../src/runtime/catalog-cache.js', () => ({
   readCachedCatalog: vi.fn(async () => undefined), writeCachedCatalog: vi.fn(async () => {}),
 }))
-vi.mock('../src/quota/quota-remote.js', () => ({
-  AgYQuotaService: class {}, registerAgYQuotaRemote: vi.fn(),
+vi.mock('../src/settings/remote.js', () => ({
+  AgYAcpService: class {}, registerAgYAcpRemote: vi.fn(),
 }))
 vi.mock('../src/adapter/antigravity-adapter.js', () => ({
   AGY_PROVIDER_ID: 'antigravity-acp',
@@ -76,6 +57,7 @@ vi.mock('../src/adapter/antigravity-adapter.js', () => ({
       return { provider, id, name: 'Example', inputModalities: this.options.canReadImages?.() ? ['text', 'image'] : ['text'] }
     }
     async listModels(provider: string) { return [await this.resolveModel(provider, 'example')] }
+    settingsModels(provider: string) { return this.listModels(provider) }
     prepareCall = vi.fn(async (provider: string, model: string) => ({
       model: await this.resolveModel(provider, model), stream: (options: AdapterRequestOptions) => this.stream(options),
     }))
@@ -160,89 +142,25 @@ function request(id: string): AdapterRequestOptions {
 beforeEach(() => {
   external.workers.length = 0
   external.events.length = 0
-  external.fetchRoutes.length = 0
   vi.clearAllMocks()
-  external.fetchClose.mockImplementation(async () => { external.events.push('fetch-close') })
 })
 afterEach(async () => {
   for (const instance of harnesses.splice(0)) await instance.dispose()
-  expect(external.fetch).not.toHaveBeenCalled()
-  expect(external.cli).not.toHaveBeenCalled()
   expect(external.download).not.toHaveBeenCalled()
   vi.unstubAllEnvs()
 })
 
 describe('apply wiring with real pool and SettingsControl', () => {
-  it('代理 OAuth 显式继承宿主环境代理，与原生请求使用同一解析规则', () => {
-    vi.stubEnv('https_proxy', 'http://ambient:7890')
-    vi.stubEnv('HTTPS_PROXY', 'http://ambient:7890')
-    vi.stubEnv('no_proxy', '*.internal')
+  it('keeps status and catalog reads local until manual discovery', async () => {
     const instance = harness()
-    const config = { proxyMode: true, proxyUrl: '' }
-    apply(instance.ctx, config)
-    expect(external.fetchRoutes).toHaveLength(2)
-    expect(external.fetchRoutes[0]!()).toBeUndefined()
-    expect(external.fetchRoutes[1]!()).toMatchObject({ url: 'http://ambient:7890' })
-    config.proxyUrl = 'http://explicit:8080'
-    expect(external.fetchRoutes[1]!()?.url).toBe('http://explicit:8080')
-    config.proxyUrl = ''
-    expect(external.fetchRoutes[1]!()?.url).toBe('http://ambient:7890')
-  })
-  it('代理模式的设置页目录读取与刷新仅走代理目录，切回 ACP 后恢复原目录', async () => {
-    const instance = harness()
-    const parsed = Config({ proxyMode: true })
-    apply(instance.ctx, parsed)
-    const models = vi.fn(async () => [{ id: 'proxy-only', name: 'Proxy only' }])
-    instance.ctx.provide('antigravityProxyCatalog', { models })
-    ;(instance.ctx.get('antigravityProxyMode') as ProxyModeBus).setRouterReady(true)
-    expect((await instance.control().models(true)).models).toEqual([{ id: 'proxy-only', name: 'Proxy only' }])
-    expect(models).toHaveBeenCalledWith(true)
-    expect(external.workers[0]!.discoverModels).not.toHaveBeenCalled()
-
-    const flag = parsed.proxyMode
-    const next = Config({ proxyMode: false }).proxyMode
-    if (!isVolatile(flag) || !isVolatile(next)) throw new Error('Expected live mode flag')
-    updateVolatile(flag, next)
-    instance.updateSettings([['proxyMode']])
+    apply(instance.ctx, Config({}))
+    expect(instance.control().account().state).toBe('idle')
     expect((await instance.control().models()).models[0]?.id).toBe('example')
-  })
-
-  it('代理组件缺席时仍关闭 ACP 目录、登录与预热', async () => {
-    const instance = harness()
-    apply(instance.ctx, Config({ proxyMode: true, autoWarmup: false }))
-    expect(await instance.control().models()).toMatchObject({ status: 'error', models: [] })
-    expect(instance.control().account().generationMode).toEqual({ requested: 'proxy', active: 'proxy', proxyRouterReady: false })
-    expect(() => instance.control().account('login')).toThrow('ACP 连接与预热功能已停用')
-    expect(() => instance.control().account('warmup')).toThrow('ACP 连接与预热功能已停用')
+    await instance.registered().listModels('antigravity-acp')
     expect(external.workers[0]!.discoverModels).not.toHaveBeenCalled()
     expect(external.download).not.toHaveBeenCalled()
+    expect(instance.ctx.subprocess.spawn).not.toHaveBeenCalled()
   })
-
-  it('代理组件上线与卸载自动切换路由和目录，并共享实时模型设置', async () => {
-    const instance = harness()
-    const parsed = Config({ proxyMode: true, modelOverrides: { proxy: { name: '自定义' } } })
-    apply(instance.ctx, parsed)
-    const bus = instance.ctx.get('antigravityProxyMode') as ProxyModeBus
-    const registration = (instance.ctx.llm.registerAdapter as Mock).mock.results[0]!.value as { replace: Mock }
-    expect(registration.replace).toHaveBeenLastCalledWith([])
-    instance.ctx.provide('antigravityProxyCatalog', { models: async () => [{ id: 'proxy', name: '自定义' }] })
-    bus.setRouterReady(true)
-    expect(registration.replace).toHaveBeenLastCalledWith([])
-    expect(instance.control().account().generationMode?.active).toBe('proxy')
-    expect(bus.modelSettings?.().modelOverrides?.proxy?.name).toBe('自定义')
-    expect((await instance.control().models()).models[0]?.id).toBe('proxy')
-    bus.setRouterReady(false)
-    expect(registration.replace).toHaveBeenLastCalledWith([])
-    expect(instance.control().account().generationMode?.active).toBe('proxy')
-    const flag = parsed.proxyMode
-    const next = Config({ proxyMode: false }).proxyMode
-    if (!isVolatile(flag) || !isVolatile(next)) throw new Error('Expected live mode flag')
-    updateVolatile(flag, next)
-    instance.updateSettings([['proxyMode']])
-    expect(registration.replace).toHaveBeenLastCalledWith(['antigravity-acp'])
-    expect((await instance.control().models()).models[0]?.id).toBe('example')
-  })
-
   it('passes live preferences to existing workers and notifies the host picker on saved model settings', () => {
     const instance = harness()
     const parsed = Config({ modelOverrides: { before: { enabled: false } } })
@@ -259,7 +177,7 @@ describe('apply wiring with real pool and SettingsControl', () => {
     instance.updateSettings([['modelOverrides']])
     expect(instance.control().account().runtime!.modelCatalogRevision).toBe(beforeRevision + 1)
     expect(instance.emit).toHaveBeenCalledWith('llm/adapters-updated')
-    instance.updateSettings([['proxyUrl']])
+    instance.updateSettings([['cancelGraceMs']])
     expect(instance.control().account().runtime!.modelCatalogRevision).toBe(beforeRevision + 1)
   })
 
@@ -299,7 +217,7 @@ describe('apply wiring with real pool and SettingsControl', () => {
     expect(control.account().state).toBe('connected')
   })
 
-  it('registers the pool and releases all worker resources and the shared fetch on unload', async () => {
+  it('registers the pool and releases all worker resources on unload', async () => {
     const instance = harness()
     apply(instance.ctx, { maxConcurrentSessions: 2 })
     const pool = instance.registered()
@@ -314,22 +232,8 @@ describe('apply wiring with real pool and SettingsControl', () => {
     await Promise.all([first, second])
     await Promise.all([a.return(undefined), b.return(undefined)])
     expect(external.workers.every(worker => worker.close.mock.calls.length === 1)).toBe(true)
-    expect(external.fetchClose).toHaveBeenCalledTimes(2)
     expect(instance.unregister).toHaveBeenCalledTimes(1)
-    expect(external.events.indexOf('fetch-close')).toBeGreaterThan(external.events.indexOf('worker-1'))
     expect(() => instance.control().account()).toThrow('已卸载')
   })
 
-  it('keeps the plugin loadable when the saved proxy is invalid, so the card can fix it', () => {
-    const instance = harness()
-    // 非法代理不能让 apply 抛穿：一旦装载失败，本插件贡献的设置卡片也跟着消失，
-    // 用户只剩手改宿主配置文件这一条路。
-    expect(() => apply(instance.ctx, { proxyUrl: 'ftp://127.0.0.1:21' })).not.toThrow()
-    expect(instance.registered()).toBeInstanceOf(PooledAcpAdapter)
-    expect(instance.control().account().state).toBe('idle')
-    const warned = (instance.ctx.logger as unknown as { warn: Mock }).warn.mock.calls.map(([message]) => String(message))
-    expect(warned.some((message) => message.includes('代理配置无效'))).toBe(true)
-    // 告警只报原因，不回显地址里的认证信息。
-    expect(warned.join('\n')).not.toContain('ftp://127.0.0.1:21')
-  })
 })

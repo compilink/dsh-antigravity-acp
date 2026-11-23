@@ -1,7 +1,7 @@
 {
-  "name": "dsh-bundle-antigravity-host",
-  "version": "0.1.48",
-  "description": "DeepSeek Harness host bundle that talks to the official Antigravity ACP server over stdio (Agent Client Protocol v1).",
+  "name": "dsh-bundle-antigravity-official-acp",
+  "version": "0.1.49-local.1",
+  "description": "Use the verified official Antigravity ACP agent with DeepSeek Harness.",
   "displayName": "Antigravity ACP",
   "keywords": [
     "dsh",
@@ -15,19 +15,18 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KouzakiUmi/dsh-antigravity-acp.git"
+    "url": "git+https://github.com/compilink/dsh-antigravity-acp.git"
   },
-  "homepage": "https://github.com/KouzakiUmi/dsh-antigravity-acp#readme",
+  "homepage": "https://github.com/compilink/dsh-antigravity-acp#readme",
   "bugs": {
-    "url": "https://github.com/KouzakiUmi/dsh-antigravity-acp/issues"
+    "url": "https://github.com/compilink/dsh-antigravity-acp/issues"
   },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
-    "./client": "./dist/client.js",
-    "./proxy": "./dist/proxy/index.js"
+    "./client": "./dist/client.js"
   },
   "engines": {
     "node": ">=22.19"
@@ -40,7 +39,6 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-model-selection",
         "@deepseek-ai/dsh-api-remotes"
       ]
     }
@@ -50,13 +48,16 @@
     "cordis.patch.yml",
     "README.md",
     "docs",
-    "LICENSE"
+    "LICENSE",
+    "scripts/official-macos-login.mjs"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-client.mjs",
-    "check": "npm run typecheck && npm run test && npm run build"
+    "check": "npm run typecheck && npm run test && npm run build",
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "prepack": "npm run build"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.4 <5",
@@ -66,10 +67,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
-    "@cortexkit/antigravity-auth-core": "3.0.14",
     "@deepseek-ai/schemastery": "^3.18.4",
     "@modelcontextprotocol/sdk": "1.32.1",
-    "undici": "8.12.3",
     "yauzl": "^3.4.0"
   },
   "devDependencies": {
@@ -87,5 +86,12 @@
     "typescript": "^5.9.3",
     "vitest": "^5.0.4"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "private": true,
+  "bundleDependencies": [
+    "@agentclientprotocol/sdk",
+    "@deepseek-ai/schemastery",
+    "@modelcontextprotocol/sdk",
+    "yauzl"
+  ]
 }

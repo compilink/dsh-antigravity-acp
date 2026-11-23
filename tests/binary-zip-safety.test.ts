@@ -2,8 +2,10 @@
  * 下载安全测试：重定向拒绝、非 2xx 状态、zip 条目校验、可执行挑选、
  * 临时文件失败清理。全部使用注入的 fake fetch / 真实临时目录，无网络。
  */
-import { describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
+import * as registry from '../src/runtime/official-release.js'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -358,108 +360,114 @@ describe('ensureAgentBinary 临时文件清理', () => {
     }
   })
 
-  it.skipIf(process.platform === 'win32')('posix 整链下载后两个入口实际带执行位，旧缓存命中时补齐', async () => {
-    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-exec-cache-'))
-    try {
-      const archive = zip([
-        { name: 'agy_acp_server.par', data: Buffer.from('main') },
-        { name: 'localharness_external', data: Buffer.from('helper') },
-      ])
-      const options = { cacheDir, version: '1.4.0', env: {}, fetchImpl: fakeFetch(200, Uint8Array.from(archive)) }
-      const first = await ensureAgentBinary(options)
-      const helper = join(first.executablePath, '..', 'localharness_external')
-      expect((await stat(first.executablePath)).mode & 0o111).toBe(0o111)
-      expect((await stat(helper)).mode & 0o111).toBe(0o111)
-      // 旧版本只给主程序补执行位：模拟遗留的 0644 辅助程序，缓存命中路径应修复它。
-      const { chmod } = await import('node:fs/promises')
-      await chmod(helper, 0o644)
-      const second = await ensureAgentBinary({ ...options, autoDownload: false })
-      expect(second.source).toBe('cache')
-      expect((await stat(helper)).mode & 0o111).toBe(0o111)
-    } finally {
-      await rm(cacheDir, { recursive: true, force: true })
-    }
+})
+
+describe('official archive verification', () => {
+  const roots: string[] = []
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    for (const dir of roots.splice(0)) await rm(dir, { recursive: true, force: true })
   })
 
-  it('两个宿主并发下载同一版本时复用已提交产物，不删除另一个实例的文件', async () => {
-    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-concurrent-install-'))
-    const executableName = process.platform === 'win32' ? 'agy_acp_server.exe' : 'agy_acp_server.par'
-    const archive = zip([{ name: executableName, data: Buffer.from('official fixture') }])
+  async function fixture() {
+    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-signed-cache-'))
+    roots.push(cacheDir)
+    const archive = zip([
+      { name: 'agy_acp_server.par', data: Buffer.from('main') },
+      { name: 'localharness_external', data: Buffer.from('helper') },
+    ])
+    vi.spyOn(registry, 'officialArchiveDigest').mockReturnValue(createHash('sha256').update(archive).digest('hex'))
+    const options = { cacheDir, version: '1.5.2', platform: 'linux' as const, arch: 'arm64', env: {}, fetchImpl: fakeFetch(200, Uint8Array.from(archive)) }
+    const cacheFile = join(cacheDir, '1.5.2', 'official-linux-aarch64.zip')
+    return { archive, options, cacheFile }
+  }
+
+  it('pins every supported architecture to the registry and rejects unknown releases', () => {
+    for (const platform of ['linux', 'darwin', 'windows'] as const) {
+      for (const arch of ['x86_64', 'aarch64'] as const) expect(registry.officialArchiveDigest('1.5.2', platform, arch)).toMatch(/^[0-9a-f]{64}$/)
+    }
+    expect(registry.officialArchiveDigest('1.5.2', 'linux', 'aarch64')).toBe('e729e05ef54ef0763e48900032466b47fa7c9939cde257f93ba49410ab577acb')
+    expect(registry.officialArchiveDigest('9.9.9', 'linux', 'aarch64')).toBeUndefined()
+    return expect(ensureAgentBinary({ version: '9.9.9', env: {} })).rejects.toMatchObject({ code: AGY_BINARY_ERROR.UNVERIFIED })
+  })
+
+  it('restores both executables from a verified offline ZIP, ignoring previously edited siblings and extra files', async () => {
+    const { options, archive, cacheFile } = await fixture()
+    const first = await ensureAgentBinary(options)
+    expect(first).toMatchObject({ source: 'download', checksumVerified: true })
+    expect(await readFile(cacheFile)).toEqual(archive)
+    const sibling = (path: string, name: string) => join(path, '..', name)
+    await writeFile(first.executablePath, 'modified main')
+    await writeFile(sibling(first.executablePath, 'localharness_external'), 'modified helper')
+    await writeFile(sibling(first.executablePath, 'extra.dll'), 'unpackaged DLL')
+    const second = await ensureAgentBinary({ ...options, autoDownload: false })
+    expect(second).toMatchObject({ source: 'cache', checksumVerified: true })
+    expect(second.executablePath).not.toBe(first.executablePath)
+    expect(await readFile(second.executablePath, 'utf8')).toBe('main')
+    expect(await readFile(sibling(second.executablePath, 'localharness_external'), 'utf8')).toBe('helper')
+    expect(await readdir(sibling(second.executablePath, '.'))).not.toContain('extra.dll')
+    if (process.platform !== 'win32') {
+      expect((await stat(second.executablePath)).mode & 0o111).toBe(0o111)
+      expect((await stat(sibling(second.executablePath, 'localharness_external'))).mode & 0o111).toBe(0o111)
+    }
+    await first.release()
+    expect(await readFile(second.executablePath, 'utf8')).toBe('main')
+    await second.release()
+    expect(await readdir(join(options.cacheDir, 'runtime'))).toEqual([])
+  })
+
+  it('rejects a changed ZIP in cache, including a change confined to the helper', async () => {
+    const { options, cacheFile } = await fixture()
+    const first = await ensureAgentBinary(options)
+    await first.release()
+    await writeFile(cacheFile, zip([
+      { name: 'agy_acp_server.par', data: Buffer.from('main') },
+      { name: 'localharness_external', data: Buffer.from('modified') },
+    ]))
+    await expect(ensureAgentBinary({ ...options, autoDownload: false })).rejects.toMatchObject({ code: AGY_BINARY_ERROR.UNVERIFIED })
+    expect(await readdir(join(options.cacheDir, 'runtime'))).toEqual([])
+  })
+
+  it.skipIf(process.platform === 'win32')('refuses a previously shared runtime directory', async () => {
+    const { options } = await fixture()
+    const runtime = join(options.cacheDir, 'runtime')
+    await mkdir(runtime)
+    await chmod(runtime, 0o777)
+    await expect(ensureAgentBinary(options)).rejects.toMatchObject({ code: AGY_BINARY_ERROR.UNVERIFIED })
+    expect(await readdir(runtime)).toEqual([])
+  })
+
+  it('rejects a download with a different digest before populating the cache', async () => {
+    const { options, cacheFile } = await fixture()
+    await expect(ensureAgentBinary({ ...options, fetchImpl: fakeFetch(200, 'changed') })).rejects.toMatchObject({ code: AGY_BINARY_ERROR.UNVERIFIED })
+    await expect(stat(cacheFile)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readdir(join(options.cacheDir, 'runtime'))).toEqual([])
+  })
+
+  it('separate hosts can install and release without overwriting each other’s running files', async () => {
+    const { options, archive } = await fixture()
     let arrived = 0
     let release!: () => void
-    const bothDownloading = new Promise<void>((resolve) => { release = resolve })
+    const both = new Promise<void>((resolve) => { release = resolve })
     const fetchImpl: FetchLike = async () => {
-      arrived += 1
-      if (arrived === 2) release()
-      await bothDownloading
+      if (++arrived === 2) release()
+      await both
       return { ok: true, status: 200, arrayBuffer: async () => Uint8Array.from(archive).buffer }
     }
-    try {
-      const options = { cacheDir, version: '1.4.0', env: {}, fetchImpl }
-      const [first, second] = await Promise.all([ensureAgentBinary(options), ensureAgentBinary(options)])
-      expect(first.executablePath).toBe(second.executablePath)
-      expect(await readFile(first.executablePath, 'utf8')).toBe('official fixture')
-      expect([first.source, second.source].sort()).toEqual(['cache', 'download'])
-    } finally {
-      await rm(cacheDir, { recursive: true, force: true })
-    }
+    const [first, second] = await Promise.all([ensureAgentBinary({ ...options, fetchImpl }), ensureAgentBinary({ ...options, fetchImpl })])
+    expect(first.executablePath).not.toBe(second.executablePath)
+    await first.release()
+    expect(await readFile(second.executablePath, 'utf8')).toBe('main')
+    await second.release()
   })
 
-  it('下载失败后版本目录不留临时残留', async () => {
-    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-cache-'))
-    try {
-      await expect(
-        ensureAgentBinary({
-          autoDownload: true,
-          version: '1.4.0',
-          cacheDir,
-          fetchImpl: fakeFetch(302),
-        }),
-      ).rejects.toMatchObject({ code: AGY_BINARY_ERROR.REDIRECT_REFUSED })
-      // 版本目录可以存在，但 staging 临时目录必须被清理。
-      const versionDir = join(cacheDir, '1.4.0')
-      const leftovers = (await readdir(versionDir)).filter((name) => name.startsWith('.staging-'))
-      expect(leftovers).toEqual([])
-    } finally {
-      await rm(cacheDir, { recursive: true, force: true })
-    }
-  })
-
-  it('autoDownload=false 且无缓存时报 AGY_BINARY_MISSING', async () => {
-    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-cache-'))
-    try {
-      await expect(ensureAgentBinary({ autoDownload: false, version: '1.4.0', cacheDir })).rejects.toMatchObject({
-        code: AGY_BINARY_ERROR.BINARY_MISSING,
-      })
-    } finally {
-      await rm(cacheDir, { recursive: true, force: true })
-    }
-  })
-
-  it('含目录条目的官方式 zip 能整链下载解压并挑出可执行文件', async () => {
-    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-cache-'))
-    try {
-      const platform = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux'
-      const executableName = process.platform === 'win32' ? 'agy-acp-server.exe' : 'agy-acp-server'
-      const archiveRoot = `agy-acp-server-1.4.0-${platform}-x86_64`
-      const archive = zip([
-        { name: `${archiveRoot}/`, data: Buffer.alloc(0) },
-        { name: `${archiveRoot}/bin/`, data: Buffer.alloc(0) },
-        { name: `${archiveRoot}/bin/${executableName}`, data: Buffer.from('fake executable') },
-        { name: `${archiveRoot}/README.txt`, data: Buffer.from('hi') },
-      ])
-      const resolution = await ensureAgentBinary({
-        autoDownload: true,
-        version: '1.4.0',
-        cacheDir,
-        fetchImpl: fakeFetch(200, Uint8Array.from(archive)),
-      })
-      expect(resolution.source).toBe('download')
-      expect(resolution.executablePath.replaceAll('\\', '/')).toContain(
-        `1.4.0/extract-1.4.0/${archiveRoot}/bin/${executableName}`,
-      )
-    } finally {
-      await rm(cacheDir, { recursive: true, force: true })
-    }
+  it('cleans a failed download and refuses extraction-only legacy caches offline', async () => {
+    const { options } = await fixture()
+    await expect(ensureAgentBinary({ ...options, fetchImpl: fakeFetch(302) })).rejects.toMatchObject({ code: AGY_BINARY_ERROR.REDIRECT_REFUSED })
+    const legacy = join(options.cacheDir, '1.5.2', 'extract-1.5.2')
+    await mkdir(legacy)
+    await writeFile(join(legacy, 'agy_acp_server.par'), 'unsigned')
+    await expect(ensureAgentBinary({ ...options, autoDownload: false })).rejects.toMatchObject({ code: AGY_BINARY_ERROR.BINARY_MISSING })
+    expect(await readdir(join(options.cacheDir, 'runtime'))).toEqual([])
   })
 })

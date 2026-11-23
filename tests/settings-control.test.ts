@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { SettingsControl } from '../src/quota/control.js'
+import { SettingsControl } from '../src/settings/control.js'
 
 function deferred() {
   let resolve!: () => void
@@ -8,59 +8,6 @@ function deferred() {
 }
 
 describe('设置页账户与目录控制', () => {
-  it('切换目录来源后失败不显示旧模式的目录，在途旧结果也不会覆盖新模式', async () => {
-    let source = 'acp'
-    let release!: (value: Array<{ id: string; name: string }>) => void
-    const gate = new Promise<Array<{ id: string; name: string }>>(resolve => { release = resolve })
-    let pending = false
-    const control = new SettingsControl({
-      connect: async () => {}, modelSource: () => source,
-      models: async () => {
-        if (source === 'proxy') throw new Error('proxy unavailable')
-        return pending ? gate : [{ id: 'acp', name: 'ACP' }]
-      },
-    })
-    expect((await control.models()).models).toHaveLength(1)
-    pending = true
-    const old = control.models()
-    source = 'proxy'
-    expect(await control.models()).toMatchObject({ status: 'error', models: [] })
-    release([{ id: 'old', name: 'Old' }])
-    expect(await old).toMatchObject({ status: 'error', models: [] })
-    await control.dispose()
-  })
-  it('代理账户代际变化后清空旧目录，刷新失败也不回退到前账户', async () => {
-    let revision = 1
-    const control = new SettingsControl({
-      connect: async () => {}, modelSource: () => `proxy:${revision}`,
-      models: async () => {
-        if (revision !== 1) throw new Error('signed out')
-        return [{ id: 'account-a', name: 'Account A' }]
-      },
-    })
-    expect((await control.models()).models[0]?.id).toBe('account-a')
-    revision = 2
-    expect(await control.models(true)).toMatchObject({ status: 'error', models: [] })
-    await control.dispose()
-  })
-
-  it('预热调用共享连接入口，状态读取可带实时快照且不会重新启动', async () => {
-    const gate = deferred()
-    const warmup = vi.fn(async () => gate.promise)
-    const connect = vi.fn(async () => {})
-    const control = new SettingsControl({ warmup, connect, models: async () => [],
-      runtime: () => ({ phase: 'ready', phaseElapsedMs: 20, processRunning: true, starts: 1, reuses: 0, recycles: 0 }) })
-    expect(control.account().runtime?.starts).toBe(1)
-    expect(warmup).not.toHaveBeenCalled()
-    expect(control.account('warmup').state).toBe('connecting')
-    control.account('warmup')
-    await Promise.resolve()
-    expect(warmup).toHaveBeenCalledTimes(1)
-    expect(connect).not.toHaveBeenCalled()
-    gate.resolve()
-    await vi.waitFor(() => expect(control.account().message).toContain('保留'))
-    await control.dispose()
-  })
   it('状态读取不登录；显式连接 single-flight，完成前不报告成功', async () => {
     const gate = deferred()
     const connect = vi.fn(async () => gate.promise)
@@ -117,17 +64,6 @@ describe('设置页账户与目录控制', () => {
     control.account('cancel')
     await vi.waitFor(() => expect(control.account().state).toBe('cancelled'))
     expect(connect).not.toHaveBeenCalled()
-    await control.dispose()
-  })
-
-  it('代理模式从控制层拒绝 ACP 登录与预热', async () => {
-    const connect = vi.fn(async () => {})
-    const warmup = vi.fn(async () => {})
-    const control = new SettingsControl({ connect, warmup, acpEnabled: () => false, models: async () => [] })
-    expect(() => control.account('login')).toThrow('ACP 连接与预热功能已停用')
-    expect(() => control.account('warmup')).toThrow('ACP 连接与预热功能已停用')
-    expect(connect).not.toHaveBeenCalled()
-    expect(warmup).not.toHaveBeenCalled()
     await control.dispose()
   })
 

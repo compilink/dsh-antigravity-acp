@@ -138,7 +138,6 @@ describe('宿主兼容性声明', () => {
     // 部署里（宿主对 graph 里找不到的 inject 名静默跳过），留着是死声明。
     for (const pkg of [
       '@deepseek-ai/dsh-client-ui-settings',
-      '@deepseek-ai/dsh-client-ui-model-selection',
       '@deepseek-ai/dsh-api-remotes',
     ]) {
       expect(inject).toContain(pkg)
