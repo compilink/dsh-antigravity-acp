@@ -91,7 +91,7 @@ main().catch(error => {
   const known = {
     INVALID_HOME: '请在 macOS 上运行，并传入 DSH 已绑定、可写的 HOME 目录。',
     EACCES: '目录不可写，或 macOS 阻止了程序启动。请检查运行账户权限。',
-    ENOENT: '未找到绑定目录或程序文件。请先安装本地 ACP 插件。',
+    ENOENT: '未找到绑定目录或程序文件。请先将 Antigravity ACP 插件安装到 DSH。',
     AGY_BINARY_UNVERIFIED: '官方归档或缓存目录未通过完整性检查。',
     AGY_DOWNLOAD_TRANSFER_FAILED: '官方下载失败，请检查网络后重试。',
     AGY_AUTH_TIMEOUT: '登录未在五分钟内完成，可重新打开登录器。',

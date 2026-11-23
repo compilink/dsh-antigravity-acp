@@ -12,6 +12,12 @@ Linux ARM64 的归档约 252 MiB，每个运行中的服务实例另需约 815 M
 
 插件在用户主动连接时调用官方 ACP。官方服务使用其运行用户的授权状态。容器内服务与 macOS 桌面属于不同环境。切换账号、授权与撤销均由官方入口处理。不要把浏览器授权回调、访问令牌、刷新令牌写进 DSH 插件设置或聊天。
 
-macOS 承载 Docker 时，可使用本 fork 的双击登录器。部署时将仓库中的 `scripts/登录 Antigravity.command` 放入 DSH 本地部署根目录的 `bin/`。它在 Mac 上启动校验过的官方 macOS 程序，只给该进程指定与容器相同的持久化 HOME。请在 Google 打开的浏览器中自行完成授权，再回到 DSH 的设置页连接并刷新模型目录。登录器的 `--check-only` 仅验证官方程序握手与个人登录能力。
+macOS 承载 Docker 时，可使用本 fork 的双击登录器。在部署根目录执行下列命令，将已安装的登录器放入 `bin/`。
+
+```sh
+install -m 755 "data/profiles/web/node_modules/dsh-bundle-antigravity-official-acp/scripts/登录 Antigravity.command" "bin/登录 Antigravity.command"
+```
+
+它在 Mac 上启动校验过的官方 macOS 程序，只给该进程指定与容器相同的持久化 HOME。请在 Google 打开的浏览器中自行完成授权，再回到 DSH 的设置页连接并刷新模型目录。登录器的 `--check-only` 仅验证官方程序握手与个人登录能力。
 
 [ACP Registry 发行记录](https://github.com/agentclientprotocol/registry/blob/e29b5bf3bfd8756db5d901690b43dc31e926ccd5/antigravity-acp/agent.json)
