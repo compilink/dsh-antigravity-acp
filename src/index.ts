@@ -471,7 +471,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   })
   const control = new SettingsControl({
     runtime: () => ({ ...adapter.read(), modelCatalogRevision }),
-    connect: async (signal) => { await adapter.discoverModels(signal, true) },
+    connect: async (signal, allowAuthentication) => { await adapter.discoverModels(signal, allowAuthentication) },
     models: async (force) => {
       if (force) await adapter.discoverModels(undefined, false)
       // Include disabled rows in Settings so users can re-enable them.

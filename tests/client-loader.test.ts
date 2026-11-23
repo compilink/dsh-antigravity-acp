@@ -34,6 +34,7 @@ describe('official ACP browser client', () => {
     expect(bundle.descriptors.map(item => item.id)).toEqual([packageId + '#agyAcp/account', packageId + '#agyAcp/models'])
     expect(account!.parameters[0]!.codec.typeSymbol).toBe(packageId + '#AgYAcpAccountRequest')
     expect(models!.result.typeSymbol).toBe(packageId + '#AgYAcpModelsResult')
+    expect(account!.parameters[0]!.codec.create().parse({ action: 'verify' })).toEqual({ action: 'verify' })
     expect(() => account!.parameters[0]!.codec.create().parse({ action: 'unexpected' })).toThrow()
     expect(() => models!.parameters[0]!.codec.create().parse({ force: 'yes' })).toThrow()
   })

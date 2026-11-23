@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { InvocationDescriptor, TypertCodec, TypertSchema } from '@deepseek-ai/dsh-typert-protocol'
-import type { SettingsControl, AccountSnapshot, ModelSnapshot } from './control.js'
+import type { SettingsControl, AccountAction, AccountSnapshot, ModelSnapshot } from './control.js'
 
 export const PACKAGE_NAME = 'dsh-bundle-antigravity-official-acp'
 export const AGY_ACP_SERVICE = 'agyAcp'
@@ -22,11 +22,12 @@ function strictCodec(typeSymbol: string, parse: (value: unknown) => unknown): Ty
 
 const requestCodec = strictCodec(`${PACKAGE_NAME}#AgYAcpModelsRequest`, parseRequest)
 
-function parseAccountRequest(value: unknown): { action: 'status' | 'login' | 'cancel' } {
+function parseAccountRequest(value: unknown): { action: AccountAction } {
   if (value === undefined) return { action: 'status' }
-  if (!value || typeof value !== 'object' || !('action' in value)
-    || !['status', 'login', 'cancel'].includes(String(value.action))) throw new TypeError('Invalid AgYAccountRequest')
-  return { action: value.action as 'status' | 'login' | 'cancel' }
+  if (!value || typeof value !== 'object' || !('action' in value)) throw new TypeError('Invalid AgYAccountRequest')
+  const { action } = value
+  if (action === 'status' || action === 'verify' || action === 'login' || action === 'cancel') return { action }
+  throw new TypeError('Invalid AgYAccountRequest')
 }
 function parseAccount(value: unknown): unknown {
   if (!value || typeof value !== 'object' || !('state' in value) || !('message' in value)
@@ -93,7 +94,7 @@ export class AgYAcpService extends TypertRemoteService {
     this.control = options.control
   }
 
-  account(request?: { action: 'status' | 'login' | 'cancel' }): AccountSnapshot {
+  account(request?: { action: AccountAction }): AccountSnapshot {
     return this.control.account(parseAccountRequest(request).action)
   }
 

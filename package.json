@@ -1,6 +1,6 @@
 {
   "name": "dsh-bundle-antigravity-official-acp",
-  "version": "0.1.49",
+  "version": "0.1.50",
   "description": "Use the verified official Antigravity ACP agent with DeepSeek Harness.",
   "displayName": "Antigravity ACP",
   "keywords": [
@@ -49,6 +49,8 @@
     "README.md",
     "docs",
     "LICENSE",
+    "scripts/install-macos-url-helper.mjs",
+    "scripts/macos-login-url.applescript",
     "scripts/official-macos-login.mjs",
     "scripts/登录 Antigravity.command"
   ],

@@ -8,6 +8,15 @@ window.__ModuleLoader__.load({
     /* @include client-i18n/en-host.js */
     /* @include client-i18n/core.js */
     const PROVIDER = 'antigravity-acp'
+    /** The macOS helper runs on the browser's machine and serves its local DSH deployment. */
+    function canOpenMacHelper() {
+      const location = window.location
+      const nav = window.navigator
+      return window.top === window.self && ['http:', 'https:'].includes(location?.protocol)
+        && ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)
+        && /^(MacIntel|Macintosh|macOS)$/i.test(nav?.userAgentData?.platform || nav?.platform || '')
+        && !(nav?.maxTouchPoints > 1)
+    }
     /** Settings namespace projected from Config's volatile fields in src/settings.ts. */
     const ENTRY_ID = 'llm-antigravity-acp'
     /** Live fields owned by this card; ordinary fields stay in the host config editor. */
@@ -280,6 +289,7 @@ window.__ModuleLoader__.load({
     function AntigravitySettingsCard(props) {
       const remote = props.remote
       const [account, setAccount] = React.useState(undefined)
+      const [helperHint, setHelperHint] = React.useState('')
       const [models, setModels] = React.useState([])
       const [modelBusy, setModelBusy] = React.useState(false)
       const [modelMessage, setModelMessage] = React.useState('')
@@ -521,6 +531,16 @@ window.__ModuleLoader__.load({
         style: { ...ACTION, minHeight: '32px', padding: '5px 12px', fontWeight: settingsPage === id ? 650 : 450, borderColor: settingsPage === id ? '#177c55' : 'rgba(128,128,128,.22)', background: settingsPage === id ? 'rgba(23,124,85,.12)' : 'transparent' },
       }, label)
       const busy = ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime)
+      const localMac = canOpenMacHelper()
+      const openMacHelper = (event) => {
+        if (busy || event.detail > 1) return
+        try {
+          window.location.assign('dsh-antigravity-login://authorize')
+          setHelperHint(msg('请允许浏览器打开 Mac 登录助手。完成授权后点“验证 ACP 连接”。若助手未打开，请检查本机是否已安装助手。'))
+        } catch {
+          setHelperHint(msg('浏览器未能打开登录助手。请检查本机是否已安装助手，再试一次。'))
+        }
+      }
       const readonly = !loading && view && !writable
       const saveVisible = dirtyKeys.length > 0 || loading || readonly || conflicts.length > 0 || Boolean(status)
 
@@ -548,8 +568,17 @@ window.__ModuleLoader__.load({
                   h('div', { style: { fontSize: '12px', fontWeight: 650, color: connection.color } }, connection.label),
                   h('p', { role: 'status', style: { fontSize: '11px', lineHeight: 1.5, opacity: .7, overflowWrap: 'anywhere', margin: '3px 0 0' } }, connection.description))),
               h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
-                h('button', { type: 'button', style: PRIMARY, disabled: !props.control || busy, onClick: () => accountAction('login') }, t(account?.state === 'connecting' ? '正在连接…' : '连接 / 登录 ACP')),
-                ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, t(account?.state === 'cancelling' ? '正在取消…' : '取消连接')) : null))),
+                localMac ? h('button', { type: 'button', style: PRIMARY, disabled: !props.control || busy, onClick: openMacHelper }, t('在 Mac 上授权')) : null,
+                h('button', { type: 'button', style: localMac ? ACTION : PRIMARY, disabled: !props.control || busy, onClick: () => {
+                  setHelperHint('')
+                  return accountAction(localMac ? 'verify' : 'login')
+                } }, t(account?.state === 'connecting' ? '正在连接…' : localMac ? '验证 ACP 连接' : '连接 / 登录 ACP')),
+                ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, t(account?.state === 'cancelling' ? '正在取消…' : '取消连接')) : null),
+              localMac && helperHint ? h('p', { role: 'status', style: { fontSize: '12px', margin: '10px 0 0' } }, t(helperHint), ' ',
+                h('a', { href: 'https://github.com/compilink/dsh-antigravity-acp/blob/main/docs/configuration.md', target: '_blank', rel: 'noreferrer' }, t('助手安装说明'))) : null,
+              h('p', { style: { fontSize: '11px', margin: '10px 0 0', opacity: .75 } },
+                t('Google 要求 DSH 等第三方模型后端使用 API Key 或企业认证，个人订阅授权不适用于此用途。'), ' ',
+                h('a', { href: 'https://discuss.ai.google.dev/t/an-acp-service-compliance-question/200200/2', target: '_blank', rel: 'noreferrer' }, t('账号使用说明'))))),
 
         h('div', { id: 'agy-settings-page-models', role: 'tabpanel', style: pageStyle('models') },
           h('section', { style: PANEL, 'aria-label': t('模型列表') },
@@ -612,7 +641,7 @@ window.__ModuleLoader__.load({
     }
     const accountRequest = codec('AgYAcpAccountRequest', (value) => {
       if (value === undefined) return { action: 'status' }
-      if (!record(value) || !['status', 'login', 'cancel'].includes(value.action)) throw new TypeError('Invalid ACP account action')
+      if (!record(value) || !['status', 'login', 'verify', 'cancel'].includes(value.action)) throw new TypeError('Invalid ACP account action')
       return { action: value.action }
     })
     const modelsRequest = codec('AgYAcpModelsRequest', (value) => {

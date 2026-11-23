@@ -21,13 +21,20 @@ afterEach(async () => {
   await act(async () => { for (const renderer of renderers.splice(0)) renderer.unmount() })
 })
 
-function loadCard() {
+type Browser = {
+  location?: { protocol: string; hostname: string; assign(url: string): void }
+  navigator?: { platform: string; maxTouchPoints?: number; language?: string }
+  framed?: boolean
+}
+
+function loadCard(browser: Browser) {
   let registration: { factory(require: (id: string) => unknown): { apply(ctx: unknown): void } } | undefined
   const components = new Map<string, React.ComponentType<Record<string, unknown>>>()
   const intervals = new Map<number, { callback: () => void; delay: number }>()
   let timerId = 0
   runInNewContext(buildClientSource(), {
-    window: { __ModuleLoader__: { load: (value: typeof registration) => { registration = value } }, innerHeight: 800, addEventListener: () => {}, removeEventListener: () => {} },
+    window: { __ModuleLoader__: { load: (value: typeof registration) => { registration = value } }, location: browser.location, navigator: browser.navigator, top: browser.framed ? {} : undefined, innerHeight: 800, addEventListener: () => {}, removeEventListener: () => {} },
+    navigator: browser.navigator,
     document: { documentElement: { clientWidth: 1200 }, addEventListener: () => {}, removeEventListener: () => {} },
     setInterval: (callback: () => void, delay: number) => { intervals.set(++timerId, { callback, delay }); return timerId },
     clearInterval: (id: number) => intervals.delete(id),
@@ -69,8 +76,8 @@ function transport(initial = document()) {
   }
 }
 
-async function mount(remote: unknown, control?: unknown) {
-  const { Card, intervals } = loadCard()
+async function mount(remote: unknown, control?: unknown, browser: Browser = {}) {
+  const { Card, intervals } = loadCard(browser)
   let renderer!: ReactTestRenderer
   await act(async () => { renderer = create(React.createElement(Card, { remote, control })) })
   renderers.push(renderer)
@@ -128,6 +135,62 @@ describe('settings card with real React state and effects', () => {
     expect(control.mock.calls.at(-1)).toEqual(['account', { action: 'status' }])
     await act(async () => { await button(renderer, '取消连接').props.onClick() })
     expect(intervals.size).toBe(0)
+  })
+
+  it.each(['localhost', '127.0.0.1', '[::1]'])('hands off explicit clicks on %s to the Mac helper and verifies separately', async (hostname) => {
+    const assign = vi.fn()
+    let state = 'idle'
+    const control = vi.fn(async (method: string, request?: { action?: string }) => {
+      if (method === 'models') return catalog()
+      if (request?.action === 'verify') state = 'connecting'
+      if (request?.action === 'cancel') state = 'cancelled'
+      return { state, message: 'ACP' }
+    })
+    const { renderer, intervals } = await mount(transport().remote, control, {
+      location: { hostname, protocol: 'http:', assign }, navigator: { platform: 'MacIntel' },
+    })
+    expect(assign).not.toHaveBeenCalled()
+    const launch = button(renderer, '在 Mac 上授权').props.onClick
+    await act(async () => { launch({ detail: 1 }); launch({ detail: 2 }) })
+    expect(assign.mock.calls).toEqual([['dsh-antigravity-login://authorize']])
+    expect(control.mock.calls).toEqual([['account', { action: 'status' }], ['models', undefined]])
+    expect(intervals.size).toBe(0)
+    expect(renderedText(renderer)).toContain('若助手未打开')
+    await act(async () => { await button(renderer, '验证 ACP 连接').props.onClick() })
+    expect(control.mock.calls.at(-1)).toEqual(['account', { action: 'verify' }])
+    expect(button(renderer, '在 Mac 上授权').props.disabled).toBe(true)
+    await act(async () => { await button(renderer, '取消连接').props.onClick() })
+    expect(assign).toHaveBeenCalledTimes(1)
+    expect(intervals.size).toBe(0)
+  })
+
+  it('shows the installation guide when browser policy refuses the helper', async () => {
+    const { renderer, intervals } = await mount(transport().remote, controlWith(), {
+      location: { hostname: 'localhost', protocol: 'https:', assign() { throw new Error('blocked') } },
+      navigator: { platform: 'MacIntel', language: 'en-US' },
+    })
+    await act(async () => { button(renderer, 'Authorize on this Mac').props.onClick({ detail: 0 }) })
+    expect(renderedText(renderer)).toContain('The browser could not open the sign-in helper.')
+    expect(renderedText(renderer)).toContain('Helper installation guide')
+    expect(button(renderer, 'Verify ACP connection').props.disabled).toBeFalsy()
+    expect(intervals.size).toBe(0)
+  })
+
+  it.each([
+    ['mac.example', 'https:', 'MacIntel', 0, false],
+    ['localhost.example', 'http:', 'MacIntel', 0, false],
+    ['127.0.0.1', 'file:', 'MacIntel', 0, false],
+    ['localhost', 'http:', 'Win32', 0, false],
+    ['localhost', 'http:', 'MacIntel', 5, false],
+    ['localhost', 'http:', 'MacIntel', 0, true],
+  ] as const)('keeps the host connection flow on %s %s %s with touch=%s framed=%s', async (hostname, protocol, platform, maxTouchPoints, framed) => {
+    const assign = vi.fn()
+    const control = controlWith()
+    const { renderer } = await mount(transport().remote, control, { location: { hostname, protocol, assign }, navigator: { platform, maxTouchPoints }, framed })
+    expect(button(renderer, '在 Mac 上授权')).toBeUndefined()
+    await act(async () => { await button(renderer, '连接 / 登录 ACP').props.onClick() })
+    expect(control).toHaveBeenCalledWith('account', { action: 'login' })
+    expect(assign).not.toHaveBeenCalled()
   })
 
   it('保存栏常驻顶部，只提供一个保存入口，编辑和撤销更新未保存计数', async () => {

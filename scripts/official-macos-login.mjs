@@ -69,7 +69,7 @@ async function main() {
     }
     console.log('请在 Google 官方程序打开的浏览器中登录。可按 Control-C 取消。')
     await link.authenticate(OAUTH_PERSONAL_AUTH_METHOD, controller.signal)
-    console.log('官方 ACP 已确认授权。请回到 DSH 的 Antigravity ACP 设置，点“连接 / 登录 ACP”，再刷新模型列表。')
+    console.log('官方 ACP 已确认授权。请回到 DSH 的 Antigravity ACP 设置，点“验证 ACP 连接”，再刷新模型列表。')
   } finally {
     if (child) {
       child.kill()

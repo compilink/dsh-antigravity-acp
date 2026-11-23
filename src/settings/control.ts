@@ -3,6 +3,8 @@ import { redactSensitiveText } from '../runtime/redact.js'
 import type { AcpLifecycleSnapshot } from '../runtime/lifecycle.js'
 import type { ModelCapacity } from '../adapter/model-settings.js'
 
+export type AccountAction = 'status' | 'login' | 'verify' | 'cancel'
+
 export interface AccountSnapshot {
   state: 'idle' | 'connecting' | 'cancelling' | 'connected' | 'cancelled' | 'error'
   message: string
@@ -16,7 +18,7 @@ export interface ModelSnapshot {
 }
 type ModelRow = { id: string; name: string; inputModalities?: readonly string[] } & ModelCapacity
 export interface ControlOptions {
-  connect(signal: AbortSignal): Promise<void>
+  connect(signal: AbortSignal, allowAuthentication: boolean): Promise<void>
   runtime?(): AcpLifecycleSnapshot
   models(force: boolean): Promise<readonly ModelRow[]>
 }
@@ -29,19 +31,20 @@ export class SettingsControl {
   private rows: ModelSnapshot['models'] = []
   constructor(private readonly options: ControlOptions) {}
 
-  account(action: 'status' | 'login' | 'cancel' = 'status'): AccountSnapshot {
+  account(action: AccountAction = 'status'): AccountSnapshot {
     if (this.closed) throw new Error('设置服务已卸载')
     if (action === 'cancel' && this.controller) {
       this.set('cancelling', '正在取消官方连接…')
       this.controller.abort()
     }
-    if (action === 'login' && !this.pending) {
+    if ((action === 'login' || action === 'verify') && !this.pending) {
       const controller = new AbortController()
       this.controller = controller
-      this.set('connecting', '正在连接官方 ACP；如需授权，请在运行官方进程的主机上完成登录')
+      const allowAuthentication = action === 'login'
+      this.set('connecting', allowAuthentication ? '正在连接官方 ACP；如需授权，请在运行官方进程的主机上完成登录' : '正在验证已授权的 ACP 连接…')
       const pending = Promise.resolve().then(() => {
         controller.signal.throwIfAborted()
-        return this.options.connect(controller.signal)
+        return this.options.connect(controller.signal, allowAuthentication)
       })
         .then(() => {
           if (!this.closed) this.set(controller.signal.aborted ? 'cancelled' : 'connected', controller.signal.aborted ? '连接已取消' : 'ACP 会话已验证，模型目录已读取，可开始聊天')
