@@ -1,0 +1,61 @@
+name: Publish prebuilt plugin
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release.yml']
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: publish-prebuilt-plugin
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify and publish the tagged package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUGIN_PACKAGE: dsh-bundle-antigravity-official-acp
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init --quiet source
+          git -C source fetch --quiet --no-tags "https://github.com/$GITHUB_REPOSITORY.git" \
+            'refs/heads/main:refs/remotes/origin/main' 'refs/tags/v*:refs/tags/v*'
+          case "$GITHUB_REF" in
+            refs/heads/main)
+              git -C source merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+              version="$(git -C source show "$GITHUB_SHA:package.json" | jq -er --arg n "$PLUGIN_PACKAGE" 'select(.name == $n) | .version')"
+              tag="v$version"
+              ;;
+            refs/tags/v*) tag="$GITHUB_REF_NAME" ;;
+            *) exit 1 ;;
+          esac
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tagged="$(git -C source rev-parse --verify "refs/tags/$tag^{commit}")"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$tagged" == "$(git -C source rev-parse --verify "$GITHUB_SHA^{commit}")" ]]
+          else
+            git -C source merge-base --is-ancestor "$tagged" "$GITHUB_SHA"
+          fi
+          git -C source merge-base --is-ancestor "$tagged" refs/remotes/origin/main
+          archive="$PLUGIN_PACKAGE-${tag#v}.tgz"
+          git -C source show "$tagged:releases/$archive" > "$archive"
+          git -C source show "$tagged:releases/$archive.sha256" > "$archive.sha256"
+          [[ "$(sha256sum "$archive")" == "$(cat "$archive.sha256")" ]]
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$tag" \
+              --notes 'Prebuilt DSH plugin archive and SHA-256 checksum.' "$archive" "$archive.sha256"
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease |
+            jq -e '.isDraft == false and .isPrerelease == false' >/dev/null
+          for file in "$archive" "$archive.sha256"; do
+            assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            if ! grep -Fxq -- "$file" <<<"$assets"; then
+              gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$file"
+            fi
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir verify --pattern "$file"
+            cmp "$file" "verify/$file"
+          done
