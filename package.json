@@ -1,6 +1,6 @@
 {
   "name": "dsh-bundle-antigravity-official-acp",
-  "version": "0.1.50",
+  "version": "0.1.51",
   "description": "Use the verified official Antigravity ACP agent with DeepSeek Harness.",
   "displayName": "Antigravity ACP",
   "keywords": [

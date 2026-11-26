@@ -532,6 +532,9 @@ window.__ModuleLoader__.load({
       }, label)
       const busy = ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime)
       const localMac = canOpenMacHelper()
+      const desktop = window.location?.protocol === 'dsh-app:' && window.location.hostname === 'app'
+        && /^(MacIntel|Macintosh|macOS)$/i.test(window.navigator?.userAgentData?.platform || window.navigator?.platform || '')
+      const verifyOnly = localMac || desktop
       const openMacHelper = (event) => {
         if (busy || event.detail > 1) return
         try {
@@ -571,9 +574,11 @@ window.__ModuleLoader__.load({
                 localMac ? h('button', { type: 'button', style: PRIMARY, disabled: !props.control || busy, onClick: openMacHelper }, t('在 Mac 上授权')) : null,
                 h('button', { type: 'button', style: localMac ? ACTION : PRIMARY, disabled: !props.control || busy, onClick: () => {
                   setHelperHint('')
-                  return accountAction(localMac ? 'verify' : 'login')
-                } }, t(account?.state === 'connecting' ? '正在连接…' : localMac ? '验证 ACP 连接' : '连接 / 登录 ACP')),
+                  return accountAction(verifyOnly ? 'verify' : 'login')
+                } }, t(account?.state === 'connecting' ? '正在连接…' : verifyOnly ? '验证 ACP 连接' : '连接 / 登录 ACP')),
                 ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, t(account?.state === 'cancelling' ? '正在取消…' : '取消连接')) : null),
+              desktop ? h('p', { style: { fontSize: '12px', margin: '10px 0 0' } },
+                t('在此 Mac 上为官方 ACP 配置适用的身份后，点击“验证 ACP 连接”。成功后可在“模型”中查看目录。使用 Gemini API Key 请打开 DSH 的“模型”设置。')) : null,
               localMac && helperHint ? h('p', { role: 'status', style: { fontSize: '12px', margin: '10px 0 0' } }, t(helperHint), ' ',
                 h('a', { href: 'https://github.com/compilink/dsh-antigravity-acp/blob/main/docs/configuration.md', target: '_blank', rel: 'noreferrer' }, t('助手安装说明'))) : null,
               h('p', { style: { fontSize: '11px', margin: '10px 0 0', opacity: .75 } },

@@ -4,15 +4,19 @@
 
 **账号适用范围。** Google 在针对 DSH 的答复中说明，个人 Google AI Pro 或 Ultra 订阅的 `oauth-personal` 登录不适用于将 Antigravity 用作第三方 agent 的模型后端，并指向 Google AI Studio API Key 或企业认证。已有 Gemini API Key 的用户可以直接配置 DSH 的 Google 提供商。本插件的 Mac 登录助手调用的是官方程序的个人授权流程。[Google 对 DSH 的答复](https://discuss.ai.google.dev/t/an-acp-service-compliance-question/200200/2) · [Antigravity 服务条款](https://antigravity.google/terms)
 
+## macOS 客户端
+
+在官方 macOS 客户端的「插件 → 添加插件」粘贴同一发行包的下载地址，启用后进入「设置 → Antigravity ACP」。桌面宿主在本机运行，点击「验证 ACP 连接」会使用官方程序已有的适用身份，面板展示连接进度、取消和模型目录。已有 Docker Web 部署仍使用下方方式安装到自己的 profile。
+
 ## 在线安装
 
-在运行 DSH 的主机或容器内执行以下命令，将预构建的 `v0.1.50` 安装到 Web profile。安装前请备份现有 profile 和持久化数据。如果该 profile 已经启用了同名提供商，请确保只有一个插件注册 `antigravity-acp`。
+在运行 DSH 的主机或容器内执行以下命令，将预构建的 `v0.1.51` 安装到 Web profile。安装前请备份现有 profile 和持久化数据。如果该 profile 已经启用了同名提供商，请确保只有一个插件注册 `antigravity-acp`。
 
 ```sh
-dsh plugin --profile web add https://github.com/compilink/dsh-antigravity-acp/releases/download/v0.1.50/dsh-bundle-antigravity-official-acp-0.1.50.tgz
+dsh plugin --profile web add https://github.com/compilink/dsh-antigravity-acp/releases/download/v0.1.51/dsh-bundle-antigravity-official-acp-0.1.51.tgz
 ```
 
-重启 DSH 后打开 **设置 → Antigravity ACP**。发布包包含编译产物和插件的运行依赖，官方 ACP 程序在首次需要时单独准备。手动下载发布包时可以核对校验文件。[GitHub Release](https://github.com/compilink/dsh-antigravity-acp/releases/tag/v0.1.50) · [发布包 SHA-256](https://github.com/compilink/dsh-antigravity-acp/releases/download/v0.1.50/dsh-bundle-antigravity-official-acp-0.1.50.tgz.sha256)
+重启 DSH 后打开 **设置 → Antigravity ACP**。发布包包含编译产物和插件的运行依赖，官方 ACP 程序在首次需要时单独准备。手动下载发布包时可以核对校验文件。[GitHub Release](https://github.com/compilink/dsh-antigravity-acp/releases/tag/v0.1.51) · [发布包 SHA-256](https://github.com/compilink/dsh-antigravity-acp/releases/download/v0.1.51/dsh-bundle-antigravity-official-acp-0.1.51.tgz.sha256)
 
 ## 连接和选择模型
 

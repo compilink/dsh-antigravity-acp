@@ -116,6 +116,7 @@ const EN_UI = {
   'ACP 账户与连接': 'ACP account and connection',
   '连接 / 登录 ACP': 'Connect / sign in to ACP',
   '在 Mac 上授权': 'Authorize on this Mac',
+  '在此 Mac 上为官方 ACP 配置适用的身份后，点击“验证 ACP 连接”。成功后可在“模型”中查看目录。使用 Gemini API Key 请打开 DSH 的“模型”设置。': 'After configuring an eligible identity for the official ACP service on this Mac, select Verify ACP connection. Its catalog appears under Models. To use a Gemini API key, open Models in DSH settings.',
   '验证 ACP 连接': 'Verify ACP connection',
   '请允许浏览器打开 Mac 登录助手。完成授权后点“验证 ACP 连接”。若助手未打开，请检查本机是否已安装助手。': 'Allow the browser to open the Mac sign-in helper. After signing in, select Verify ACP connection. If the helper does not open, check that it is installed on this Mac.',
   '浏览器未能打开登录助手。请检查本机是否已安装助手，再试一次。': 'The browser could not open the sign-in helper. Check that the helper is installed on this Mac, then try again.',

@@ -137,6 +137,20 @@ describe('settings card with real React state and effects', () => {
     expect(intervals.size).toBe(0)
   })
 
+  it('verifies the existing desktop identity without opening a helper or starting interactive sign-in', async () => {
+    const assign = vi.fn()
+    const control = controlWith()
+    const { renderer } = await mount(transport().remote, control, {
+      location: { hostname: 'app', protocol: 'dsh-app:', assign }, navigator: { platform: 'MacIntel' },
+    })
+    expect(button(renderer, '在 Mac 上授权')).toBeUndefined()
+    expect(button(renderer, '连接 / 登录 ACP')).toBeUndefined()
+    expect(renderedText(renderer)).toContain('Gemini API Key')
+    await act(async () => { await button(renderer, '验证 ACP 连接').props.onClick() })
+    expect(control).toHaveBeenCalledWith('account', { action: 'verify' })
+    expect(assign).not.toHaveBeenCalled()
+  })
+
   it.each(['localhost', '127.0.0.1', '[::1]'])('hands off explicit clicks on %s to the Mac helper and verifies separately', async (hostname) => {
     const assign = vi.fn()
     let state = 'idle'
